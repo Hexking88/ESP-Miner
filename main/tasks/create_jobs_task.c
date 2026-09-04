@@ -22,6 +22,16 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
+static inline uint64_t get_random_extranonce2(uint8_t len)
+{
+    uint64_t rnd = ((uint64_t)esp_random() << 32) | esp_random();
+    if (len > 0 && len < 8) {
+        uint64_t mask = (1ULL << (len * 8)) - 1ULL;
+        rnd &= mask;
+    }
+    return rnd;
+}
+
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty);
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
 static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty, uint64_t extranonce_2_counter);
@@ -51,7 +61,7 @@ void create_jobs_task(void *pvParameters)
     double difficulty = GLOBAL_STATE->pool_difficulty;
     void *current_work = NULL;
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
-    uint64_t extranonce_2 = 0;
+    uint64_t extranonce_2 = get_random_extranonce2(GLOBAL_STATE->extranonce_2_len);
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
@@ -59,8 +69,8 @@ void create_jobs_task(void *pvParameters)
 
     while (1) {
         if (GLOBAL_STATE->reset_extranonce2) {
-            ESP_LOGI(TAG, "Resetting extranonce2 to 0 due to set_extranonce request");
-            extranonce_2 = 0;
+            ESP_LOGI(TAG, "Resetting extranonce2 to random value due to set_extranonce request");
+            extranonce_2 = get_random_extranonce2(GLOBAL_STATE->extranonce_2_len);
             GLOBAL_STATE->reset_extranonce2 = false;
         }
 
@@ -130,7 +140,7 @@ void create_jobs_task(void *pvParameters)
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
 
-            extranonce_2 = 0;
+            extranonce_2 = get_random_extranonce2(GLOBAL_STATE->extranonce_2_len);
 
             // Check clean_jobs flag
             bool clean;
@@ -177,13 +187,13 @@ void create_jobs_task(void *pvParameters)
         if (active_protocol == STRATUM_PROTOCOL_V2) {
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
                 generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty, extranonce_2);
-                extranonce_2++;
+                extranonce_2 = get_random_extranonce2(GLOBAL_STATE->sv2_conn ? GLOBAL_STATE->sv2_conn->extranonce_size : 4);
             } else {
                 generate_work_sv2(GLOBAL_STATE, (sv2_job_t *)current_work, difficulty);
             }
         } else {
             generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty);
-            extranonce_2++;
+            extranonce_2 = get_random_extranonce2(GLOBAL_STATE->extranonce_2_len);
         }
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
