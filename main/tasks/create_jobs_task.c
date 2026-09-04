@@ -5,6 +5,7 @@
 #include "global_state.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include "mining.h"
 #include "string.h"
 #include "esp_timer.h"
