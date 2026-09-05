@@ -33,6 +33,16 @@ static inline uint64_t get_random_extranonce2(uint8_t len)
     return rnd;
 }
 
+static inline uint64_t increment_extranonce2(uint64_t val, uint8_t len)
+{
+    val++;
+    if (len > 0 && len < 8) {
+        uint64_t mask = (1ULL << (len * 8)) - 1ULL;
+        val &= mask;
+    }
+    return val;
+}
+
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty);
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
 static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty, uint64_t extranonce_2_counter);
@@ -62,6 +72,8 @@ void create_jobs_task(void *pvParameters)
     double difficulty = GLOBAL_STATE->pool_difficulty;
     void *current_work = NULL;
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
+    
+    // Initiële random startwaarde bij het opstarten van de taak
     uint64_t extranonce_2 = get_random_extranonce2(GLOBAL_STATE->extranonce_2_len);
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -141,7 +153,12 @@ void create_jobs_task(void *pvParameters)
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
 
-            extranonce_2 = get_random_extranonce2(GLOBAL_STATE->extranonce_2_len);
+            // NIEUWE JOB BINNENGEKOMEN:
+            // Trek direct een nieuw random startgetal voor deze nieuwe pool job
+            uint8_t len = (current_work_protocol == STRATUM_PROTOCOL_V2 && stratum_v2_is_extended_channel(GLOBAL_STATE))
+                            ? (GLOBAL_STATE->sv2_conn ? GLOBAL_STATE->sv2_conn->extranonce_size : 4)
+                            : GLOBAL_STATE->extranonce_2_len;
+            extranonce_2 = get_random_extranonce2(len);
 
             // Check clean_jobs flag
             bool clean;
@@ -184,17 +201,18 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        // Generate and send job
+        // Generate and send job, daarna sequentieel ophogen (+1) voor de volgende iteratie
         if (active_protocol == STRATUM_PROTOCOL_V2) {
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
                 generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty, extranonce_2);
-                extranonce_2 = get_random_extranonce2(GLOBAL_STATE->sv2_conn ? GLOBAL_STATE->sv2_conn->extranonce_size : 4);
+                uint8_t len = GLOBAL_STATE->sv2_conn ? GLOBAL_STATE->sv2_conn->extranonce_size : 4;
+                extranonce_2 = increment_extranonce2(extranonce_2, len);
             } else {
                 generate_work_sv2(GLOBAL_STATE, (sv2_job_t *)current_work, difficulty);
             }
         } else {
             generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty);
-            extranonce_2 = get_random_extranonce2(GLOBAL_STATE->extranonce_2_len);
+            extranonce_2 = increment_extranonce2(extranonce_2, GLOBAL_STATE->extranonce_2_len);
         }
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
