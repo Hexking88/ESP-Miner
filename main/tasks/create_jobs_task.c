@@ -1,6 +1,5 @@
 #include <sys/time.h>
 #include <limits.h>
-#include <math.h>
 
 #include "work_queue.h"
 #include "global_state.h"
@@ -23,22 +22,6 @@ static const char *TAG = "create_jobs_task";
 
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
-
-// Hoe hoger de factor, hoe sterker de bias naar de kleinste waarden (bijv. 2.0 = kwadratisch, 3.0 = kubisch)
-#define SKEW_FACTOR 3.0f
-
-static inline uint32_t get_power_skewed_random(uint32_t min, uint32_t max, float factor)
-{
-    if (min >= max) return min;
-
-    // Converteer 32-bits hardware random getal naar floating-point [0.0, 1.0]
-    double u = (double)esp_random() / (double)UINT32_MAX;
-
-    // Verheffen tot de macht (u ^ factor): waarden concentreren zich dichtbij 0.0
-    double skewed = pow(u, factor);
-
-    return min + (uint32_t)(skewed * (double)(max - min));
-}
 
 static inline uint64_t get_random_extranonce2(uint8_t len)
 {
@@ -64,7 +47,6 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
 static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty, uint64_t extranonce_2_counter);
 
-// Free a work item using the correct free function for the protocol it was created under
 static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protocol_t protocol)
 {
     if (!work) return;
@@ -72,7 +54,7 @@ static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protoc
         if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
             sv2_ext_job_free((sv2_ext_job_t *)work);
         } else {
-            free(work);  // sv2_job_t is flat
+            free(work);
         }
     } else {
         STRATUM_V1_free_mining_notify(work);
@@ -83,14 +65,11 @@ void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
-    // before any task that touches them can run.
-
     double difficulty = GLOBAL_STATE->pool_difficulty;
     void *current_work = NULL;
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
     
-    // Initiële random startwaarde bij het opstarten van de taak
+    // Alleen bij opstarten een random startpunt om te synchroniseren
     uint64_t extranonce_2 = get_random_extranonce2(GLOBAL_STATE->extranonce_2_len);
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -99,17 +78,13 @@ void create_jobs_task(void *pvParameters)
 
     while (1) {
         if (GLOBAL_STATE->reset_extranonce2) {
-            ESP_LOGI(TAG, "Resetting extranonce2 to random value due to set_extranonce request");
+            ESP_LOGI(TAG, "Resetting extranonce2 due to set_extranonce request");
             extranonce_2 = get_random_extranonce2(GLOBAL_STATE->extranonce_2_len);
             GLOBAL_STATE->reset_extranonce2 = false;
         }
 
-        // Read protocol dynamically each iteration (coordinator may have switched it)
         stratum_protocol_t active_protocol = GLOBAL_STATE->stratum_protocol;
 
-        // If protocol changed, discard current_work (it belongs to the old protocol)
-        // Always update current_work_protocol so the post-dequeue check doesn't
-        // incorrectly discard the first valid work item from the new protocol.
         if (active_protocol != current_work_protocol) {
             if (current_work != NULL) {
                 ESP_LOGI(TAG, "Protocol switched from %s to %s, discarding current work",
@@ -128,16 +103,10 @@ void create_jobs_task(void *pvParameters)
         if (new_work != NULL) {
             active_protocol = GLOBAL_STATE->stratum_protocol;
 
-            // Free previous work using the protocol it was created under
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
             current_work = NULL;
 
             if (active_protocol != current_work_protocol) {
-                // Protocol switched during our blocking dequeue.
-                // The dequeued item may be from either the old or new protocol —
-                // we cannot safely determine which type it is, so discard it.
-                // free() is safe for both sv2_job_t (flat) and mining_notify (malloc'd;
-                // internal strings leak but this is a rare protocol-switch event).
                 ESP_LOGW(TAG, "Protocol switch detected during dequeue, discarding stale item");
                 free(new_work);
                 current_work_protocol = active_protocol;
@@ -145,7 +114,6 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
 
-            // Protocol unchanged — item matches current_work_protocol. Safe to cast.
             if (current_work_protocol == STRATUM_PROTOCOL_V2) {
                 if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
                     ESP_LOGI(TAG, "New Work Dequeued SV2 ext job %lu", ((sv2_ext_job_t *)new_work)->job_id);
@@ -170,14 +138,11 @@ void create_jobs_task(void *pvParameters)
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
 
-            // NIEUWE JOB BINNENGEKOMEN:
-            // Trek direct een nieuw random startgetal voor deze nieuwe pool job
             uint8_t len = (current_work_protocol == STRATUM_PROTOCOL_V2 && stratum_v2_is_extended_channel(GLOBAL_STATE))
                             ? (GLOBAL_STATE->sv2_conn ? GLOBAL_STATE->sv2_conn->extranonce_size : 4)
                             : GLOBAL_STATE->extranonce_2_len;
             extranonce_2 = get_random_extranonce2(len);
 
-            // Check clean_jobs flag
             bool clean;
             if (current_work_protocol == STRATUM_PROTOCOL_V2) {
                 if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
@@ -196,19 +161,12 @@ void create_jobs_task(void *pvParameters)
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
-            // SV2 standard channel: the ASIC has enough nonce+version space
-            // (2^32 nonces x version rolls) to keep mining without re-feeding.
-            // Re-sending the same job restarts the nonce search from 0 and
-            // produces duplicate shares. Only send work on new jobs.
-            // (V1 and SV2 extended are fine — extranonce_2 gives unique work each time.)
             if (active_protocol == STRATUM_PROTOCOL_V2 && !stratum_v2_is_extended_channel(GLOBAL_STATE)) {
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
         }
 
-        // Final protocol check before generating work — protocol may have switched
-        // during a timeout dequeue while we still hold stale current_work
         active_protocol = GLOBAL_STATE->stratum_protocol;
         if (active_protocol != current_work_protocol) {
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
@@ -218,7 +176,7 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        // Generate and send job, daarna sequentieel ophogen (+1) voor de volgende iteratie
+        // Standaard, waterdichte Stratum logica: sequentieel ophogen (+1)
         if (active_protocol == STRATUM_PROTOCOL_V2) {
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
                 generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty, extranonce_2);
@@ -251,7 +209,6 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
     calculate_merkle_root_hash(coinbase_tx_hash, (uint8_t(*)[32])notification->merkle_branches, notification->n_merkle_branches, merkle_root);
 
     bm_job *next_job = malloc(sizeof(bm_job));
-
     if (next_job == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for new job");
         return;
@@ -259,14 +216,11 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
 
     construct_bm_job(notification, merkle_root, GLOBAL_STATE->version_mask, difficulty, next_job);
 
-    // Methode 2: Power skewed random starting nonce (met bias naar lage waarden)
-    next_job->starting_nonce = get_power_skewed_random(0, UINT32_MAX, SKEW_FACTOR);
-
+    next_job->starting_nonce = 0;
     next_job->extranonce2 = strdup(extranonce_2_str);
     next_job->jobid = strdup(notification->job_id);
     next_job->version_mask = GLOBAL_STATE->version_mask;
 
-    // Check if ASIC is initialized before trying to send work
     if (!GLOBAL_STATE->ASIC_initalized) {
         ESP_LOGW(TAG, "ASIC not initialized, skipping job send");
         free(next_job->jobid);
@@ -278,7 +232,6 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
     ASIC_send_work(GLOBAL_STATE, next_job);
 }
 
-// Construct bm_job directly from SV2 fields (no coinbase/merkle computation needed).
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, double difficulty)
 {
     bm_job *next_job = malloc(sizeof(bm_job));
@@ -292,10 +245,7 @@ static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, dou
     next_job->version = sv2_job->version;
     next_job->target = sv2_job->nbits;
     next_job->ntime = sv2_job->ntime;
-
-    // Methode 2: Power skewed random starting nonce (met bias naar lage waarden)
-    next_job->starting_nonce = get_power_skewed_random(0, UINT32_MAX, SKEW_FACTOR);
-
+    next_job->starting_nonce = 0;
     next_job->pool_diff = difficulty;
 
     reverse_32bit_words(sv2_job->merkle_root, next_job->merkle_root);
@@ -331,11 +281,10 @@ static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, dou
         next_job->num_midstates = 1;
     }
 
-    // SV2 job metadata
     char jobid_str[16];
     snprintf(jobid_str, sizeof(jobid_str), "%" PRIu32, sv2_job->job_id);
     next_job->jobid = strdup(jobid_str);
-    next_job->extranonce2 = strdup(""); // unused in SV2 standard
+    next_job->extranonce2 = strdup("");
     next_job->version_mask = version_mask;
 
     if (!GLOBAL_STATE->ASIC_initalized) {
@@ -349,7 +298,6 @@ static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, dou
     ASIC_send_work(GLOBAL_STATE, next_job);
 }
 
-// Extended channel work generation
 static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_job,
                                    double difficulty, uint64_t extranonce_2_counter)
 {
@@ -385,14 +333,10 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
                                (const uint8_t (*)[32])ext_job->merkle_path,
                                ext_job->merkle_path_count, merkle_root);
 
-    // Fill bm_job fields
     next_job->version = ext_job->version;
     next_job->target = ext_job->nbits;
     next_job->ntime = ext_job->ntime;
-
-    // Methode 2: Power skewed random starting nonce (met bias naar lage waarden)
-    next_job->starting_nonce = get_power_skewed_random(0, UINT32_MAX, SKEW_FACTOR);
-
+    next_job->starting_nonce = 0;
     next_job->pool_diff = difficulty;
 
     reverse_32bit_words(merkle_root, next_job->merkle_root);
