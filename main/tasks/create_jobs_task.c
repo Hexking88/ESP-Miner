@@ -5,6 +5,7 @@
 #include "work_queue.h"
 #include "global_state.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_random.h"
 #include "mining.h"
 #include "string.h"
@@ -23,11 +24,18 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
-// Genereert een willekeurig 32-bits startgetal via de ESP32 hardware-RNG
-static inline uint64_t get_random_start_extranonce2(void)
+// Genereert een volledig willekeurig getal per ronde (gebalanceerd tussen klein en groot)
+static inline uint64_t get_random_extranonce2(void)
 {
-    // Masker op 32-bit (0xFFFFFFFF) zodat het altijd binnen 4-byte pools past
-    return (uint64_t)esp_random() & 0xFFFFFFFFULL;
+    uint32_t rand_val = esp_random();
+    
+    if (rand_val & 1) {
+        // Klein getal (tussen 0 en 1000)
+        return (uint64_t)(esp_random() % 1001);
+    } else {
+        // Groot getal (willekeurig ergens in de volledige 32-bits ruimte)
+        return (uint64_t)esp_random() & 0xFFFFFFFFULL;
+    }
 }
 
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty);
@@ -56,18 +64,15 @@ void create_jobs_task(void *pvParameters)
     double difficulty = GLOBAL_STATE->pool_difficulty;
     void *current_work = NULL;
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
-
-    // Start direct met een willekeurig getal
-    uint64_t extranonce_2 = get_random_start_extranonce2();
+    
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
-    ESP_LOGI(TAG, "ASIC Ready! Random extranonce2 start ingesteld op: %" PRIu64, extranonce_2);
+    ESP_LOGI(TAG, "ASIC Ready! Pure random extranonce2 loterij modus actief.");
 
     while (1) {
         if (GLOBAL_STATE->reset_extranonce2) {
-            extranonce_2 = get_random_start_extranonce2();
-            ESP_LOGI(TAG, "Resetting extranonce2 naar nieuw random getal: %" PRIu64 " due to set_extranonce request", extranonce_2);
+            ESP_LOGI(TAG, "Reset extranonce2 gevraagd.");
             GLOBAL_STATE->reset_extranonce2 = false;
         }
 
@@ -128,10 +133,6 @@ void create_jobs_task(void *pvParameters)
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
 
-            // Nieuw werk van de pool: kies een vers willekeurig startpunt
-            extranonce_2 = get_random_start_extranonce2();
-            ESP_LOGI(TAG, "Nieuw werk ontvangen: extranonce_2 start ingesteld op random getal: %" PRIu64, extranonce_2);
-
             // Check clean_jobs flag
             bool clean;
             if (current_work_protocol == STRATUM_PROTOCOL_V2) {
@@ -166,20 +167,20 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        // Genereer werk en stuur naar ASIC (+ loggen en ophogen)
+        // Genereer een ELKE KEER een nieuw willekeurig extranonce_2 getal (geen ++ meer)
+        uint64_t extranonce_2 = get_random_extranonce2();
+
+        // Generate and send job
         if (active_protocol == STRATUM_PROTOCOL_V2) {
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
-                ESP_LOGI(TAG, "[JOB SEND SV2 EXT] Actuele extranonce_2: %" PRIu64, extranonce_2);
+                ESP_LOGI(TAG, "[JOB SEND SV2 EXT] Willekeurige extranonce_2: %" PRIu64, extranonce_2);
                 generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty, extranonce_2);
-                extranonce_2++;
             } else {
                 generate_work_sv2(GLOBAL_STATE, (sv2_job_t *)current_work, difficulty);
             }
         } else {
-            // Stratum V1
-            ESP_LOGI(TAG, "[JOB SEND V1] Actuele extranonce_2: %" PRIu64, extranonce_2);
+            ESP_LOGI(TAG, "[JOB SEND V1] Willekeurige extranonce_2: %" PRIu64, extranonce_2);
             generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty);
-            extranonce_2++;
         }
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
