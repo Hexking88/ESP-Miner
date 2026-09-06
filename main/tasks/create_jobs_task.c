@@ -6,7 +6,6 @@
 #include "global_state.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_random.h"
 #include "mining.h"
 #include "string.h"
 #include "esp_timer.h"
@@ -23,20 +22,6 @@ static const char *TAG = "create_jobs_task";
 
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
-
-// Genereert een volledig willekeurig getal per ronde (gebalanceerd tussen klein en groot)
-static inline uint64_t get_random_extranonce2(void)
-{
-    uint32_t rand_val = esp_random();
-    
-    if (rand_val & 1) {
-        // Klein getal (tussen 0 en 1000)
-        return (uint64_t)(esp_random() % 1001);
-    } else {
-        // Groot getal (willekeurig ergens in de volledige 32-bits ruimte)
-        return (uint64_t)esp_random() & 0xFFFFFFFFULL;
-    }
-}
 
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty);
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
@@ -64,15 +49,17 @@ void create_jobs_task(void *pvParameters)
     double difficulty = GLOBAL_STATE->pool_difficulty;
     void *current_work = NULL;
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
-    
+    uint64_t extranonce_2 = 0;
+    uint64_t step_size = 1; // Start bij de eerste job met stapgrootte +1
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
-    ESP_LOGI(TAG, "ASIC Ready! Pure random extranonce2 loterij modus actief.");
+    ESP_LOGI(TAG, "ASIC Ready! Dynamische oplopende stapgrootte per job actief.");
 
     while (1) {
         if (GLOBAL_STATE->reset_extranonce2) {
-            ESP_LOGI(TAG, "Reset extranonce2 gevraagd.");
+            ESP_LOGI(TAG, "Resetting extranonce2 to 0 due to set_extranonce request");
+            extranonce_2 = 0;
             GLOBAL_STATE->reset_extranonce2 = false;
         }
 
@@ -121,6 +108,10 @@ void create_jobs_task(void *pvParameters)
 
             current_work = new_work;
 
+            // Zodra er een nieuwe job / nieuw blok binnenkomt, verhogen we de stapgrootte voor deze nieuwe cyclus!
+            step_size++;
+            ESP_LOGI(TAG, "Nieuwe job gedetecteerd! Extranonce_2 stapgrootte verhoogd naar: %" PRIu64, step_size);
+
             if (GLOBAL_STATE->new_set_mining_difficulty_msg) {
                 ESP_LOGI(TAG, "New pool difficulty %.2f", GLOBAL_STATE->pool_difficulty);
                 difficulty = GLOBAL_STATE->pool_difficulty;
@@ -132,6 +123,8 @@ void create_jobs_task(void *pvParameters)
                 ASIC_set_version_mask(GLOBAL_STATE, GLOBAL_STATE->version_mask);
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
+
+            extranonce_2 = 0;
 
             // Check clean_jobs flag
             bool clean;
@@ -167,20 +160,17 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        // Genereer een ELKE KEER een nieuw willekeurig extranonce_2 getal (geen ++ meer)
-        uint64_t extranonce_2 = get_random_extranonce2();
-
-        // Generate and send job
+        // Generate and send job using the dynamic step_size increments
         if (active_protocol == STRATUM_PROTOCOL_V2) {
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
-                ESP_LOGI(TAG, "[JOB SEND SV2 EXT] Willekeurige extranonce_2: %" PRIu64, extranonce_2);
                 generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty, extranonce_2);
+                extranonce_2 += step_size;
             } else {
                 generate_work_sv2(GLOBAL_STATE, (sv2_job_t *)current_work, difficulty);
             }
         } else {
-            ESP_LOGI(TAG, "[JOB SEND V1] Willekeurige extranonce_2: %" PRIu64, extranonce_2);
             generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty);
+            extranonce_2 += step_size;
         }
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
