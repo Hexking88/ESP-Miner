@@ -1,6 +1,5 @@
 #include <sys/time.h>
 #include <limits.h>
-#include <inttypes.h>
 
 #include "work_queue.h"
 #include "global_state.h"
@@ -22,6 +21,9 @@ static const char *TAG = "create_jobs_task";
 
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
+
+// Pas deze aan als je de stapgrootte in de toekomst wilt wijzigen
+#define EXTRANONCE2_STEP 101
 
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty);
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
@@ -50,11 +52,10 @@ void create_jobs_task(void *pvParameters)
     void *current_work = NULL;
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
     uint64_t extranonce_2 = 0;
-    uint64_t step_size = 1; // Start bij de eerste job met stapgrootte +1
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
-    ESP_LOGI(TAG, "ASIC Ready! Dynamische oplopende stapgrootte per job actief.");
+    ESP_LOGI(TAG, "ASIC Ready!");
 
     while (1) {
         if (GLOBAL_STATE->reset_extranonce2) {
@@ -66,6 +67,7 @@ void create_jobs_task(void *pvParameters)
         // Read protocol dynamically each iteration (coordinator may have switched it)
         stratum_protocol_t active_protocol = GLOBAL_STATE->stratum_protocol;
 
+        // If protocol changed, discard current_work (it belongs to the old protocol)
         if (active_protocol != current_work_protocol) {
             if (current_work != NULL) {
                 ESP_LOGI(TAG, "Protocol switched from %s to %s, discarding current work",
@@ -108,10 +110,6 @@ void create_jobs_task(void *pvParameters)
 
             current_work = new_work;
 
-            // Zodra er een nieuwe job / nieuw blok binnenkomt, verhogen we de stapgrootte voor deze nieuwe cyclus!
-            step_size++;
-            ESP_LOGI(TAG, "Nieuwe job gedetecteerd! Extranonce_2 stapgrootte verhoogd naar: %" PRIu64, step_size);
-
             if (GLOBAL_STATE->new_set_mining_difficulty_msg) {
                 ESP_LOGI(TAG, "New pool difficulty %.2f", GLOBAL_STATE->pool_difficulty);
                 difficulty = GLOBAL_STATE->pool_difficulty;
@@ -126,7 +124,6 @@ void create_jobs_task(void *pvParameters)
 
             extranonce_2 = 0;
 
-            // Check clean_jobs flag
             bool clean;
             if (current_work_protocol == STRATUM_PROTOCOL_V2) {
                 if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
@@ -160,18 +157,21 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        // Generate and send job using the dynamic step_size increments
+        // Genereer en verstuur job + console logging van de actieve stapgrootte
         if (active_protocol == STRATUM_PROTOCOL_V2) {
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
+                ESP_LOGI(TAG, "Generating SV2 ext job | extranonce_2: %llu | stapgrootte: %d", (unsigned long long)extranonce_2, EXTRANONCE2_STEP);
                 generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty, extranonce_2);
-                extranonce_2 += step_size;
+                extranonce_2 += EXTRANONCE2_STEP;
             } else {
                 generate_work_sv2(GLOBAL_STATE, (sv2_job_t *)current_work, difficulty);
             }
         } else {
+            ESP_LOGI(TAG, "Generating V1 job | extranonce_2: %llu | stapgrootte: %d", (unsigned long long)extranonce_2, EXTRANONCE2_STEP);
             generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty);
-            extranonce_2 += step_size;
+            extranonce_2 += EXTRANONCE2_STEP;
         }
+        
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
@@ -267,7 +267,7 @@ static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, dou
     char jobid_str[16];
     snprintf(jobid_str, sizeof(jobid_str), "%" PRIu32, sv2_job->job_id);
     next_job->jobid = strdup(jobid_str);
-    next_job->extranonce2 = strdup("");
+    next_job->extranonce2 = strdup(""); 
     next_job->version_mask = version_mask;
 
     if (!GLOBAL_STATE->ASIC_initalized) {
@@ -318,7 +318,7 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
 
     next_job->version = ext_job->version;
     next_job->target = ext_job->nbits;
-    next_job->ntime = ext_job->ntime;
+    next_job->ntime = ext_job->ntime;  
     next_job->starting_nonce = 0;
     next_job->pool_diff = difficulty;
 
