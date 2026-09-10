@@ -51,13 +51,20 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
             return;
         }
 
-        // Big-endian extranonce2:
-        //   extranonce_2 = 8, e2_len = 4 -> bytes {00,00,00,08} -> "00000008"
-        //   extranonce_2 = 256, e2_len = 4 -> bytes {00,00,01,00} -> "00000100"
+        // Random byte-order per job:
+        //   little-endian: 8 -> "08000000"
+        //   big-endian:    8 -> "00000008"
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
         if (e2_len > 0) {
-            for (size_t i = 0; i < e2_len; i++) {
-                extranonce_2_bin[i] = (extranonce_2 >> (8 * (e2_len - 1 - i))) & 0xFF;
+            if (esp_random() & 1) {
+                // Little-endian
+                size_t copy_len = (e2_len < sizeof(uint64_t)) ? e2_len : sizeof(uint64_t);
+                memcpy(extranonce_2_bin, &extranonce_2, copy_len);
+            } else {
+                // Big-endian
+                for (size_t i = 0; i < e2_len; i++) {
+                    extranonce_2_bin[i] = (extranonce_2 >> (8 * (e2_len - 1 - i))) & 0xFF;
+                }
             }
             bin2hex(extranonce_2_bin, e2_len, extranonce_2_str, sizeof(extranonce_2_str));
         }
