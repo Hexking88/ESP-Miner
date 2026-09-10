@@ -36,7 +36,7 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     uint8_t merkle_root[32];
     char extranonce_2_str[MAX_EXTRANONCE2_STR] = "";
 
-    uint32_t effective_version = job->version;
+    uint32_t effective_version = current_version;
     if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(job)) {
         effective_version = current_version;
     }
@@ -51,7 +51,6 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
             return;
         }
 
-        // Extranonce2 wordt gefixeerd op 0 (geen bytes variatie, exact zoals AntPool/Foundry)
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
         
         if (e2_len > 0 && e2_len < MAX_EXTRANONCE2_STR) {
@@ -100,64 +99,48 @@ void create_jobs_task(void *pvParameters)
 
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
-    bool current_work_sent = false;
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
-    ESP_LOGI(TAG, "ASIC Ready! (Extranonce2 strict 0, pure hardware version rolling)");
+    ESP_LOGI(TAG, "ASIC Ready! (Extranonce2 fixed 0, active version rolling loop)");
 
     while (1) {
         uint64_t start_time = esp_timer_get_time();
         uint32_t slot_notify = 0;
         TickType_t wait_ticks = (timeout_ms > 0) ? pdMS_TO_TICKS(timeout_ms) : 0;
         BaseType_t notified = xTaskNotifyWait(0, ULONG_MAX, &slot_notify, wait_ticks);
-        timeout_ms -= (esp_timer_get_time() - start_time) / 1000;
+        
+        if (timeout_ms > 0) {
+            int64_t elapsed_ms = (esp_timer_get_time() - start_time) / 1000;
+            timeout_ms = (timeout_ms > elapsed_ms) ? (timeout_ms - (int)elapsed_ms) : 0;
+        }
 
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
-            if (!new_work) continue;
-            
-            current_work = new_work;
-            GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
-            current_work_sent = false;
-            current_version = new_work->version;
+            if (new_work) {
+                current_work = new_work;
+                GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
+                current_version = new_work->version;
 
-            if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
-                ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
-                current_version_mask = new_work->version_mask;
-            }
-
-            if (!new_work->clean_jobs) {
-                continue;
-            }
-        } else {
-            if (current_work == NULL) {
-                vTaskDelay(100 / portTICK_PERIOD_MS);
-                continue;
-            }
-            if (!miner_job_is_rollable(current_work) && current_work_sent && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
-                continue;
+                if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
+                    ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
+                    current_version_mask = new_work->version_mask;
+                }
+                SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
             }
         }
 
-        // Genereer werk zonder extranonce_2 rotzooi of vervuilde strings
-        generate_work_from_miner_job(GLOBAL_STATE, current_work, current_version);
-        
-        if (!current_work_sent) {
-            SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
-        }
-        current_work_sent = true;
+        if (current_work != NULL && GLOBAL_STATE->ASIC_initalized) {
+            generate_work_from_miner_job(GLOBAL_STATE, current_work, current_version);
 
-        if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+            // Forceer een continue update van de versie zodat de chip nooit op dezelfde nonce/versie blijft hangen
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
-            uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
-            for (int i = 0; i < midstates; i++) {
-                current_version = increment_bitmask(current_version, mask);
-            }
+            current_version = increment_bitmask(current_version, mask);
         }
-        
-        timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+
+        if (timeout_ms <= 0) {
+            timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+        }
     }
 }
