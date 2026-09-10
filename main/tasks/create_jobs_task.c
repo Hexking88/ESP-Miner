@@ -36,8 +36,10 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     uint8_t merkle_root[32];
     char extranonce_2_str[MAX_EXTRANONCE2_STR] = "";
 
-    // Altijd current_version gebruiken zodat software version rolling direct doorwerkt in de header
-    uint32_t effective_version = current_version;
+    uint32_t effective_version = job->version;
+    if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(job)) {
+        effective_version = current_version;
+    }
 
     if (job->type == JOB_TYPE_SV2_STANDARD) {
         memcpy(merkle_root, job->merkle_root, 32);
@@ -136,6 +138,10 @@ void create_jobs_task(void *pvParameters)
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
+            if (!miner_job_is_rollable(current_work) && current_work_sent && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+                continue;
+            }
         }
 
         generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
@@ -144,12 +150,16 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // EXTRANONCE_2 BLIJFT 0: Versie-bits worden elke cyclus doorgeschoven om duplicate shares te voorkomen
-        uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
-        uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
-        if (midstates == 0) midstates = 1;
-        for (int i = 0; i < midstates; i++) {
-            current_version = increment_bitmask(current_version, mask);
+        // EXTRANONCE_2 BLIJFT 0: 
+        // Laat hardware version rolling over aan de ASIC als dat aan staat, 
+        // anders alleen software version rolling uitvoeren indien hardware uitgeschakeld is.
+        if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+            uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
+            uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
+            if (midstates == 0) midstates = 1;
+            for (int i = 0; i < midstates; i++) {
+                current_version = increment_bitmask(current_version, mask);
+            }
         }
 
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
