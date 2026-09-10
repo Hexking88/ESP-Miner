@@ -36,10 +36,8 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     uint8_t merkle_root[32];
     char extranonce_2_str[MAX_EXTRANONCE2_STR] = "";
 
-    uint32_t effective_version = job->version;
-    if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(job)) {
-        effective_version = current_version;
-    }
+    // Altijd current_version gebruiken zodat software version rolling direct doorwerkt in de header
+    uint32_t effective_version = current_version;
 
     if (job->type == JOB_TYPE_SV2_STANDARD) {
         memcpy(merkle_root, job->merkle_root, 32);
@@ -97,13 +95,10 @@ void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
-    // before any task that touches them can run.
-
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
-    uint64_t extranonce_2 = 0; // Vaste waarde op 0
+    uint64_t extranonce_2 = 0; // Altijd vast op 0 (net als AntPool)
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -125,25 +120,20 @@ void create_jobs_task(void *pvParameters)
             current_work_sent = false;
             current_version = new_work->version;
 
-            if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
+            if (new_work->version_mask != current_version_mask && GLOBAL_STATE$ASIC_initalized) {
                 ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
                 ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
                 current_version_mask = new_work->version_mask;
             }
 
-            extranonce_2 = 0; // Altijd gereset op 0 bij nieuwe job
+            extranonce_2 = 0; // Altijd gereset op 0 bij een nieuwe job
 
             if (!current_work->clean_jobs) {
-                // Staged job for next cycle, let current ASIC cycle finish
                 continue;
             }
         } else {
             if (current_work == NULL) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
-                continue;
-            }
-            if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && current_work_sent) {
-                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
         }
@@ -154,17 +144,14 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // EXTRANONCE_2 WORDT NIET MEER VERHOOGD (BLIJFT ALTIJD 0)
-        // Versie rolling wordt gebruikt om nieuwe varianten te genereren:
-        if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-            // Software version rolling voor ASICs zonder hardware version rolling
-            uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
-            uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
-            for (int i = 0; i < midstates; i++) {
-                current_version = increment_bitmask(current_version, mask);
-            }
+        // EXTRANONCE_2 BLIJFT 0: Versie-bits worden elke cyclus doorgeschoven om duplicate shares te voorkomen
+        uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
+        uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
+        if (midstates == 0) midstates = 1;
+        for (int i = 0; i < midstates; i++) {
+            current_version = increment_bitmask(current_version, mask);
         }
-        
+
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
