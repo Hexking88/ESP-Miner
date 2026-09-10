@@ -36,7 +36,7 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     uint8_t merkle_root[32];
     char extranonce_2_str[MAX_EXTRANONCE2_STR] = "";
 
-    uint32_t effective_version = job->version;
+    uint32_t effective_version = current_version;
     if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(job)) {
         effective_version = current_version;
     }
@@ -54,7 +54,7 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
         size_t copy_len = (e2_len < sizeof(uint64_t)) ? e2_len : sizeof(uint64_t);
         if (e2_len > 0) {
-            memcpy(extranonce_2_bin, &extranonce_2, copy_len);
+            // extranonce_2 is forced to 0 as requested, so extranonce_2_bin remains zeroed.
             bin2hex(extranonce_2_bin, e2_len, extranonce_2_str, sizeof(extranonce_2_str));
         }
 
@@ -103,7 +103,7 @@ void create_jobs_task(void *pvParameters)
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
-    uint64_t extranonce_2 = 0;
+    uint64_t extranonce_2 = 0; // Remains 0 permanently
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -131,19 +131,15 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
 
-            extranonce_2 = 0;
+            extranonce_2 = 0; // Forced to 0
 
-            if (!current_work->clean_jobs) {
+            if (!new_work->clean_jobs) {
                 // Staged job for next cycle, let current ASIC cycle finish
                 continue;
             }
         } else {
             if (current_work == NULL) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
-                continue;
-            }
-            if (!miner_job_is_rollable(current_work) && current_work_sent && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
         }
@@ -154,16 +150,15 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        if (miner_job_is_rollable(current_work)) {
-            extranonce_2++;
-        } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-            // Software version rolling for ASICs without hardware version rolling (e.g. BM1397) on SV2 Standard Channel
-            uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
-            uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
-            for (int i = 0; i < midstates; i++) {
-                current_version = increment_bitmask(current_version, mask);
-            }
+        // Version rolling implementation instead of incrementing extranonce_2
+        uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
+        uint8_t midstates = (GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates > 0) 
+                            ? GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates 
+                            : 1;
+        for (int i = 0; i < midstates; i++) {
+            current_version = increment_bitmask(current_version, mask);
         }
+
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
