@@ -37,9 +37,8 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     char extranonce_2_str[MAX_EXTRANONCE2_STR] = "";
 
     // BIP320: bij software version rolling altijd de (opgehoogde) current_version gebruiken.
-    // Bij hardware version rolling doet de ASIC het zelf, dus job->version.
     uint32_t effective_version = job->version;
-    if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+    if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(job)) {
         effective_version = current_version;
     }
 
@@ -53,14 +52,12 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
             return;
         }
 
-        // Extranonce2 staat VAST op nullen, in de lengte die de pool opgeeft.
-        //   e2_len = 4 -> "00000000"
-        //   e2_len = 8 -> "0000000000000000"
-        // De parameter extranonce_2 wordt bewust genegeerd (geen rolling).
-        (void)extranonce_2;
-
+        // Extranonce2 rolling terug AAN:
+        // kopieer de huidige tellerwaarde in de buffer, in de lengte die de pool opgeeft.
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
+        size_t copy_len = (e2_len < sizeof(uint64_t)) ? e2_len : sizeof(uint64_t);
         if (e2_len > 0) {
+            memcpy(extranonce_2_bin, &extranonce_2, copy_len);
             bin2hex(extranonce_2_bin, e2_len, extranonce_2_str, sizeof(extranonce_2_str));
         }
 
@@ -103,13 +100,10 @@ void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
-    // before any task that touches them can run.
-
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
-    uint64_t extranonce_2 = 0;              // blijft permanent 0 — geen extranonce2 rolling
+    uint64_t extranonce_2 = 0;
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -138,7 +132,7 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
 
-            // Extranonce2 blijft 0 — geen rolling.
+            // Extranonce2 teller resetten bij nieuwe job
             extranonce_2 = 0;
 
             if (!current_work->clean_jobs) {
@@ -151,8 +145,10 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
 
-            // Hardware version rolling: ASIC rolt zelf de versie-bits, geen resend nodig.
-            if (current_work_sent && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+            // Hardware version rolling: ASIC rolt zelf, geen resend nodig.
+            // Software version rolling: blijf herzenden zolang extranonce2-rolling loopt.
+            if (!miner_job_is_rollable(current_work) && current_work_sent &&
+                GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
@@ -164,18 +160,17 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // GEEN extranonce_2++ meer.
-
-        // BIP320 software version rolling voor ASICs zonder hardware version rolling.
-        // Wordt nu ALTIJD uitgevoerd (voorheen alleen als job niet-rollable was).
-        if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+        // Extranonce2 rolling terug AAN:
+        if (miner_job_is_rollable(current_work)) {
+            extranonce_2++;
+        } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+            // Software version rolling voor ASICs zonder hardware version rolling
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
             for (int i = 0; i < midstates; i++) {
                 current_version = increment_bitmask(current_version, mask);
             }
         }
-
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
