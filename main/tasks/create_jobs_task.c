@@ -17,9 +17,6 @@
 
 static const char *TAG = "create_jobs_task";
 
-#define MAX_EXTRANONCE2_LEN 32
-#define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
-
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, double difficulty);
 
 void create_jobs_task(void *pvParameters)
@@ -33,19 +30,14 @@ void create_jobs_task(void *pvParameters)
     static char last_dispatched_job_v1[64] = {0};
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
-    ESP_LOGI(TAG, "ASIC Ready! (Stratum V1 - Zero-Extranonce2 + BIP320)");
+    ESP_LOGI(TAG, "ASIC Ready! (Stratum V1 - No Extranonce2 + BIP320)");
 
     while (1) {
-        if (GLOBAL_STATE->reset_extranonce2) {
-            GLOBAL_STATE->reset_extranonce2 = false;
-        }
-
         uint64_t start_time = esp_timer_get_time();
         mining_notify *new_work = (mining_notify *)queue_dequeue_timeout(&GLOBAL_STATE->stratum_queue, timeout_ms);
         timeout_ms -= (esp_timer_get_time() - start_time) / 1000;
 
         if (new_work != NULL) {
-            // Önceki işi bellekten temizle
             if (current_work != NULL) {
                 STRATUM_V1_free_mining_notify(current_work);
                 current_work = NULL;
@@ -63,7 +55,6 @@ void create_jobs_task(void *pvParameters)
                 strncpy(last_dispatched_job_v1, current_work->job_id, sizeof(last_dispatched_job_v1) - 1);
             }
 
-            // Zorluk ve Version Rolling güncellemeleri
             if (GLOBAL_STATE->new_set_mining_difficulty_msg) {
                 ESP_LOGI(TAG, "New pool difficulty %.2f", GLOBAL_STATE->pool_difficulty);
                 difficulty = GLOBAL_STATE->pool_difficulty;
@@ -89,7 +80,6 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        // ASIC'e işi gönder
         generate_work(GLOBAL_STATE, current_work, difficulty);
 
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
@@ -98,14 +88,7 @@ void create_jobs_task(void *pvParameters)
 
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, double difficulty)
 {
-    if (GLOBAL_STATE->extranonce_2_len > MAX_EXTRANONCE2_LEN) {
-        ESP_LOGE(TAG, "extranonce_2_len %d exceeds maximum %d, skipping job", GLOBAL_STATE->extranonce_2_len, MAX_EXTRANONCE2_LEN);
-        return;
-    }
-
-    char extranonce_2_str[MAX_EXTRANONCE2_STR];
-    memset(extranonce_2_str, '0', GLOBAL_STATE->extranonce_2_len * 2);
-    extranonce_2_str[GLOBAL_STATE->extranonce_2_len * 2] = '\0';
+    const char *extranonce_2_str = "";
 
     uint8_t coinbase_tx_hash[32];
     calculate_coinbase_tx_hash(notification->coinbase_1, notification->coinbase_2, GLOBAL_STATE->extranonce_str, extranonce_2_str, coinbase_tx_hash);
