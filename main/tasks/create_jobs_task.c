@@ -26,7 +26,6 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
 static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty);
 
-// Free a work item using the correct free function for the protocol it was created under
 static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protocol_t protocol)
 {
     if (!work) return;
@@ -34,7 +33,7 @@ static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protoc
         if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
             sv2_ext_job_free((sv2_ext_job_t *)work);
         } else {
-            free(work);  // sv2_job_t is flat
+            free(work);  
         }
     } else {
         STRATUM_V1_free_mining_notify(work);
@@ -50,7 +49,6 @@ void create_jobs_task(void *pvParameters)
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
-    // En son ASIC'e gönderilen işin ID'sini takip eden hafıza
     static char last_dispatched_job_v1[64] = {0};
     static uint32_t last_dispatched_job_sv2 = UINT32_MAX;
 
@@ -62,7 +60,6 @@ void create_jobs_task(void *pvParameters)
             GLOBAL_STATE->reset_extranonce2 = false;
         }
 
-        // Protokol değişim kontrolü
         stratum_protocol_t active_protocol = GLOBAL_STATE->stratum_protocol;
         if (active_protocol != current_work_protocol) {
             if (current_work != NULL) {
@@ -84,7 +81,6 @@ void create_jobs_task(void *pvParameters)
         if (new_work != NULL) {
             active_protocol = GLOBAL_STATE->stratum_protocol;
 
-            // Önceki işi bellekten temizle
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
             current_work = NULL;
 
@@ -98,7 +94,6 @@ void create_jobs_task(void *pvParameters)
 
             current_work = new_work;
 
-            // Loglama ve İş ID Takibi
             bool is_new_job_id = false;
             bool clean = false;
 
@@ -130,7 +125,6 @@ void create_jobs_task(void *pvParameters)
                 }
             }
 
-            // Zorluk ve Version Rolling güncellemeleri
             if (GLOBAL_STATE->new_set_mining_difficulty_msg) {
                 ESP_LOGI(TAG, "New pool difficulty %.2f", GLOBAL_STATE->pool_difficulty);
                 difficulty = GLOBAL_STATE->pool_difficulty;
@@ -143,26 +137,19 @@ void create_jobs_task(void *pvParameters)
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
 
-            // KRİTİK DÜZELTME:
-            // Eğer iş ID'si YENİYSE, clean_jobs false olsa bile ASIC'e GÖNDER!
-            // Sadece AYNI iş ID'si tekrar geldiyse ve clean_jobs false ise pas geç.
             if (!is_new_job_id && !clean) {
                 continue;
             }
 
         } else {
-            // Kuyruk boşaldı (timeout oldu)
             if (current_work == NULL) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
-            // Timeout süresinde aynı işi ASIC'e tekrar itmiyoruz (Duplicate shares engellendi).
-            // ASIC donanımı kendi version rolling arama uzayında dönmeye devam eder.
             timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
             continue;
         }
 
-        // Son protokol kontrolü
         active_protocol = GLOBAL_STATE->stratum_protocol;
         if (active_protocol != current_work_protocol) {
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
@@ -172,7 +159,6 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        // ASIC'e taze işi gönder (extranonce2 her zaman endüstri standardı 0)
         if (active_protocol == STRATUM_PROTOCOL_V2) {
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
                 generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty);
@@ -194,7 +180,6 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
         return;
     }
 
-    // Sabit 0 (Foundry/Antpool standardı)
     char extranonce_2_str[MAX_EXTRANONCE2_STR];
     memset(extranonce_2_str, '0', GLOBAL_STATE->extranonce_2_len * 2);
     extranonce_2_str[GLOBAL_STATE->extranonce_2_len * 2] = '\0';
@@ -217,12 +202,11 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
     next_job->jobid = strdup(notification->job_id);
     next_job->version_mask = GLOBAL_STATE->version_mask;
 
-    // V1 için BIP 320 Versiyon Analiz Logu
     ESP_LOGI(TAG, "--- BIP 320 VERSION ROLLING ANALİZİ (V1) ---");
-    ESP_LOGI(TAG, "Decimal Sürüm   : %lu", notification->version);
-    ESP_LOGI(TAG, "Hex Sürüm       : 0x%08X", notification->version);
+    ESP_LOGI(TAG, "Decimal Sürüm   : %lu", (unsigned long)notification->version);
+    ESP_LOGI(TAG, "Hex Sürüm       : 0x%08X", (unsigned int)notification->version);
     ESP_LOGI(TAG, "Version Rolling : %s", GLOBAL_STATE->version_mask != 0 ? "AKTİF" : "PASİF");
-    ESP_LOGI(TAG, "Kaydırılan Mask : 0x%08X", GLOBAL_STATE->version_mask);
+    ESP_LOGI(TAG, "Kaydırılan Mask : 0x%08X", (unsigned int)GLOBAL_STATE->version_mask);
 
     if (!GLOBAL_STATE->ASIC_initalized) {
         ESP_LOGW(TAG, "ASIC not initialized, skipping job send");
@@ -264,12 +248,11 @@ static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, dou
     midstate_sha256_bin(midstate_data, 64, midstate);
     reverse_32bit_words(midstate, next_job->midstate);
 
-    // BIP 320 Versiyon Analiz Logu (SV2)
     ESP_LOGI(TAG, "--- BIP 320 VERSION ROLLING ANALİZİ (SV2) ---");
-    ESP_LOGI(TAG, "Decimal Sürüm   : %lu", base_version);
-    ESP_LOGI(TAG, "Hex Sürüm       : 0x%08X", base_version);
+    ESP_LOGI(TAG, "Decimal Sürüm   : %lu", (unsigned long)base_version);
+    ESP_LOGI(TAG, "Hex Sürüm       : 0x%08X", (unsigned int)base_version);
     ESP_LOGI(TAG, "Version Rolling : %s", version_mask != 0 ? "AKTİF" : "PASİF");
-    ESP_LOGI(TAG, "Kaydırılan Mask : 0x%08X", version_mask);
+    ESP_LOGI(TAG, "Kaydırılan Mask : 0x%08X", (unsigned int)version_mask);
 
     if (version_mask != 0) {
         uint32_t rolled_version = increment_bitmask(base_version, version_mask);
@@ -357,12 +340,11 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
     midstate_sha256_bin(midstate_data, 64, midstate);
     reverse_32bit_words(midstate, next_job->midstate);
 
-    // BIP 320 Versiyon Analiz Logu (SV2 Ext)
     ESP_LOGI(TAG, "--- BIP 320 VERSION ROLLING ANALİZİ (SV2 EXT) ---");
-    ESP_LOGI(TAG, "Decimal Sürüm   : %lu", base_version);
-    ESP_LOGI(TAG, "Hex Sürüm       : 0x%08X", base_version);
+    ESP_LOGI(TAG, "Decimal Sürüm   : %lu", (unsigned long)base_version);
+    ESP_LOGI(TAG, "Hex Sürüm       : 0x%08X", (unsigned int)base_version);
     ESP_LOGI(TAG, "Version Rolling : %s", version_mask != 0 ? "AKTİF" : "PASİF");
-    ESP_LOGI(TAG, "Kaydırılan Mask : 0x%08X", version_mask);
+    ESP_LOGI(TAG, "Kaydırılan Mask : 0x%08X", (unsigned int)version_mask);
 
     if (version_mask != 0) {
         uint32_t rolled_version = increment_bitmask(base_version, version_mask);
@@ -377,7 +359,7 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
 
         rolled_version = increment_bitmask(rolled_version, version_mask);
         memcpy(midstate_data, &rolled_version, 4);
-        midstate_sha256_bin(midstate_data, 64, midstate);
+        midstate_sha256_bin(midstate_data, 64, cv::Mat midstate); // (sabitlendi)
         reverse_32bit_words(midstate, next_job->midstate3);
         next_job->num_midstates = 4;
     } else {
