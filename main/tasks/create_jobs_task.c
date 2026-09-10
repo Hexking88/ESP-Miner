@@ -70,6 +70,8 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
                                    job->merkle_path_count, merkle_root);
     }
 
+    ESP_LOGI(TAG, "Work Gen -> JobID: %s | Extranonce2: %s | Version: 0x%08lX", job->job_id, extranonce_2_str, (unsigned long)effective_version);
+
     construct_bm_job_from_miner_job(job, effective_version, merkle_root, version_mask, job_diff, GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates, next_job);
     next_job->jobid = strdup(job->job_id);
     next_job->extranonce2 = strdup(extranonce_2_str);
@@ -100,7 +102,7 @@ void create_jobs_task(void *pvParameters)
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
-    uint64_t extranonce_2 = 0; // Altijd vast op 0 (geen increment)
+    uint64_t extranonce_2 = 0; // Vast op 0 (geen increment)
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -128,8 +130,6 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
 
-            // Extranonce_2 wordt hier bewust niet gereset of opgehoogd, blijft 0
-
             if (!new_work->clean_jobs) {
                 continue;
             }
@@ -144,15 +144,12 @@ void create_jobs_task(void *pvParameters)
             }
         }
 
-        // Genereert werk met extranonce_2 vast op 0
         generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
         if (!current_work_sent) {
             SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
         }
         current_work_sent = true;
 
-        // GEEN extranonce_2++ hier! 
-        // Variatie komt volledig van de hardware version rolling (of software version rolling hieronder)
         if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
