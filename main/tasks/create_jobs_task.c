@@ -36,7 +36,6 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     uint8_t merkle_root[32];
     char extranonce_2_str[MAX_EXTRANONCE2_STR] = "";
 
-    // BIP320: bij software version rolling altijd de (opgehoogde) current_version gebruiken.
     uint32_t effective_version = job->version;
     if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(job)) {
         effective_version = current_version;
@@ -52,12 +51,14 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
             return;
         }
 
-        // Extranonce2 rolling terug AAN:
-        // kopieer de huidige tellerwaarde in de buffer, in de lengte die de pool opgeeft.
+        // Big-endian extranonce2:
+        //   extranonce_2 = 8, e2_len = 4 -> bytes {00,00,00,08} -> "00000008"
+        //   extranonce_2 = 256, e2_len = 4 -> bytes {00,00,01,00} -> "00000100"
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
-        size_t copy_len = (e2_len < sizeof(uint64_t)) ? e2_len : sizeof(uint64_t);
         if (e2_len > 0) {
-            memcpy(extranonce_2_bin, &extranonce_2, copy_len);
+            for (size_t i = 0; i < e2_len; i++) {
+                extranonce_2_bin[i] = (extranonce_2 >> (8 * (e2_len - 1 - i))) & 0xFF;
+            }
             bin2hex(extranonce_2_bin, e2_len, extranonce_2_str, sizeof(extranonce_2_str));
         }
 
@@ -125,18 +126,15 @@ void create_jobs_task(void *pvParameters)
             current_work_sent = false;
             current_version = new_work->version;
 
-            // BIP320: hardware version rolling mask instellen (indien gewijzigd).
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
                 ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
                 ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
                 current_version_mask = new_work->version_mask;
             }
 
-            // Extranonce2 teller resetten bij nieuwe job
             extranonce_2 = 0;
 
             if (!current_work->clean_jobs) {
-                // Staged job for next cycle, let current ASIC cycle finish
                 continue;
             }
         } else {
@@ -144,9 +142,6 @@ void create_jobs_task(void *pvParameters)
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
-
-            // Hardware version rolling: ASIC rolt zelf, geen resend nodig.
-            // Software version rolling: blijf herzenden zolang extranonce2-rolling loopt.
             if (!miner_job_is_rollable(current_work) && current_work_sent &&
                 GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
@@ -160,11 +155,9 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // Extranonce2 rolling terug AAN:
         if (miner_job_is_rollable(current_work)) {
             extranonce_2++;
         } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-            // Software version rolling voor ASICs zonder hardware version rolling
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
             for (int i = 0; i < midstates; i++) {
