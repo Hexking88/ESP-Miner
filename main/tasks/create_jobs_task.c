@@ -20,7 +20,7 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
-static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_job_t *job, uint64_t extranonce_2, uint32_t current_version)
+static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_job_t *job, uint32_t current_version)
 {
     if (!job) return;
 
@@ -46,16 +46,17 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     } else {
         size_t e2_len = job->extranonce2_len;
         if (e2_len > MAX_EXTRANONCE2_LEN) {
-            ESP_LOGE(TAG, "extranonce_2_len %u exceeds maximum %d, skipping job", (unsigned)e2_len, MAX_EXTRANONCE2_LEN);
+            ESP_LOGE(TAG, "extranonce_2_len %u exceeds maximum %d", (unsigned)e2_len, MAX_EXTRANONCE2_LEN);
             free(next_job);
             return;
         }
 
+        // Extranonce2 wordt gefixeerd op 0 (geen bytes variatie, exact zoals AntPool/Foundry)
         uint8_t extranonce_2_bin[MAX_EXTRANONCE2_LEN] = {0};
-        size_t copy_len = (e2_len < sizeof(uint64_t)) ? e2_len : sizeof(uint64_t);
-        if (e2_len > 0) {
-            memcpy(extranonce_2_bin, &extranonce_2, copy_len);
-            bin2hex(extranonce_2_bin, e2_len, extranonce_2_str, sizeof(extranonce_2_str));
+        
+        if (e2_len > 0 && e2_len < MAX_EXTRANONCE2_STR) {
+            memset(extranonce_2_str, '0', e2_len * 2);
+            extranonce_2_str[e2_len * 2] = '\0';
         }
 
         uint8_t coinbase_tx_hash[32];
@@ -69,8 +70,6 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
                                    (const uint8_t (*)[32])job->merkle_path,
                                    job->merkle_path_count, merkle_root);
     }
-
-    ESP_LOGI(TAG, "Work Gen -> JobID: %s | Extranonce2: %s | Version: 0x%08lX", job->job_id, extranonce_2_str, (unsigned long)effective_version);
 
     construct_bm_job_from_miner_job(job, effective_version, merkle_root, version_mask, job_diff, GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates, next_job);
     next_job->jobid = strdup(job->job_id);
@@ -102,12 +101,11 @@ void create_jobs_task(void *pvParameters)
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
-    uint64_t extranonce_2 = 0; // Vast op 0 (geen increment)
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
-    ESP_LOGI(TAG, "ASIC Ready! (Extranonce2 fixed at 0, using Version Rolling)");
+    ESP_LOGI(TAG, "ASIC Ready! (Extranonce2 strict 0, pure hardware version rolling)");
 
     while (1) {
         uint64_t start_time = esp_timer_get_time();
@@ -118,14 +116,14 @@ void create_jobs_task(void *pvParameters)
 
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
-            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
+            if (!new_work) continue;
+            
             current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
             current_version = new_work->version;
 
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
-                ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
                 ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
                 current_version_mask = new_work->version_mask;
             }
@@ -144,7 +142,9 @@ void create_jobs_task(void *pvParameters)
             }
         }
 
-        generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
+        // Genereer werk zonder extranonce_2 rotzooi of vervuilde strings
+        generate_work_from_miner_job(GLOBAL_STATE, current_work, current_version);
+        
         if (!current_work_sent) {
             SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
         }
