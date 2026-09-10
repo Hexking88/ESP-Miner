@@ -36,7 +36,7 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     uint8_t merkle_root[32];
     char extranonce_2_str[MAX_EXTRANONCE2_STR] = "";
 
-    // Altijd de actieve gerolde versie gebruiken
+    // Altijd de actieve gerolde versie meegeven aan de job
     uint32_t effective_version = current_version;
 
     if (job->type == JOB_TYPE_SV2_STANDARD) {
@@ -98,7 +98,7 @@ void create_jobs_task(void *pvParameters)
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
-    uint64_t extranonce_2 = 0; // Altijd vast op 0
+    uint64_t extranonce_2 = 0; // Blijft altijd vast op 0
     uint32_t current_version = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -138,8 +138,15 @@ void create_jobs_task(void *pvParameters)
             }
         }
 
-        // Zorg dat de versie direct veranderd is VOORDAT we het werk naar de ASIC sturen als het niet de eerste keer is
-        if (current_work_sent && !GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+        // Genereer het werk met de huidige versie en extranonce_2 = 0
+        generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
+        if (!current_work_sent) {
+            SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
+        }
+        current_work_sent = true;
+
+        // VERSIE ELKE CYCLUS DOORROLLEN (Omdat extranonce_2 op 0 staat)
+        if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
             if (midstates == 0) midstates = 1;
@@ -147,12 +154,6 @@ void create_jobs_task(void *pvParameters)
                 current_version = increment_bitmask(current_version, mask);
             }
         }
-
-        generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
-        if (!current_work_sent) {
-            SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
-        }
-        current_work_sent = true;
 
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
