@@ -20,6 +20,10 @@ static const char *TAG = "create_jobs_task";
 // Vaste extranonce2: 4 bytes, allemaal nul (8 hex tekens)
 #define FIXED_EXTRANONCE2 "00000000"
 
+// Version rolling UIT: laat construct_bm_job de midstate volledig
+// opnieuw berekenen op basis van current_version.
+#define DISABLE_VERSION_ROLLING 1
+
 void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
@@ -72,11 +76,20 @@ void create_jobs_task(void *pvParameters)
             // Initialiseer versie vanuit de nieuwe job
             current_version = new_work->version;
 
+#if DISABLE_VERSION_ROLLING
+            // Rolling uit: zet mask op 0, zodat de ASIC geen version bits rolt.
+            if (current_version_mask != 0 && GLOBAL_STATE->ASIC_initalized) {
+                ESP_LOGI(TAG, "Version rolling UIT (mask=0)");
+                ASIC_set_version_mask(GLOBAL_STATE, 0);
+                current_version_mask = 0;
+            }
+#else
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
                 ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
                 ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
                 current_version_mask = new_work->version_mask;
             }
+#endif
 
             if (!current_work->clean_jobs) {
                 ESP_LOGW(TAG, "clean_jobs=false, job %s wordt alsnog verzonden",
@@ -96,11 +109,23 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
+#if DISABLE_VERSION_ROLLING
+        uint32_t version_mask = 0;
+#else
         uint32_t version_mask = current_work->version_mask;
+#endif
         double job_diff = current_work->pool_diff;
         uint8_t merkle_root[32];
 
         memcpy(merkle_root, current_work->merkle_root, 32);
+
+        // Coinbase EERST decoderen, zodat merkle_root klopt voordat de ASIC hasht.
+        if (!current_work_sent) {
+            SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
+            current_work_sent = true;
+            // Opnieuw kopiëren: decode kan merkle_root hebben bijgewerkt.
+            memcpy(merkle_root, current_work->merkle_root, 32);
+        }
 
         construct_bm_job_from_miner_job(current_work,
                                         current_version,
@@ -132,6 +157,10 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
+        // Log merkle root + ntime zodat je kunt vergelijken met de pool
+        ESP_LOGI(TAG, "merkle_root[0..3]=%02x%02x%02x%02x",
+                 merkle_root[0], merkle_root[1], merkle_root[2], merkle_root[3]);
+
         // Timing rond ASIC_send_work, zodat je ziet waar de vertraging zit
         uint64_t t0 = esp_timer_get_time();
         ASIC_send_work(GLOBAL_STATE, next_job);
@@ -144,11 +173,11 @@ void create_jobs_task(void *pvParameters)
                  next_job->extranonce2,
                  (unsigned long long)(t1 - t0));
 
-        if (!current_work_sent) {
-            SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
-        }
-        current_work_sent = true;
-
+#if DISABLE_VERSION_ROLLING
+        // Geen rolling: alleen een kleine vaste stap om unieke versies te krijgen.
+        // De ASIC berekent de midstate opnieuw per job.
+        current_version = increment_bitmask(current_version, 0x00002000);
+#else
         // Version rolling (geen extranonce2 ophoging)
         uint32_t mask = (current_work->version_mask != 0)
                             ? current_work->version_mask
@@ -162,6 +191,7 @@ void create_jobs_task(void *pvParameters)
         } else {
             current_version = increment_bitmask(current_version, mask);
         }
+#endif
 
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
