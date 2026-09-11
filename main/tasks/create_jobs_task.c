@@ -17,6 +17,9 @@
 
 static const char *TAG = "create_jobs_task";
 
+// Vaste extranonce2: 4 bytes, allemaal nul
+#define FIXED_EXTRANONCE2 "00000000"
+
 void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
@@ -33,18 +36,39 @@ void create_jobs_task(void *pvParameters)
     while (1) {
         uint64_t start_time = esp_timer_get_time();
         uint32_t slot_notify = 0;
+
+        // Clamp timeout: nooit negatief
+        if (timeout_ms < 0) {
+            timeout_ms = 0;
+        }
+
         TickType_t wait_ticks = (timeout_ms > 0) ? pdMS_TO_TICKS(timeout_ms) : 0;
         BaseType_t notified = xTaskNotifyWait(0, ULONG_MAX, &slot_notify, wait_ticks);
-        timeout_ms -= (esp_timer_get_time() - start_time) / 1000;
+
+        int elapsed_ms = (int)((esp_timer_get_time() - start_time) / 1000);
+        timeout_ms -= elapsed_ms;
+        if (timeout_ms < 0) {
+            timeout_ms = 0;
+        }
 
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
-            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
+            if (new_work == NULL) {
+                ESP_LOGE(TAG, "miner_job_get_slot(%lu) gaf NULL, sla over",
+                         (unsigned long)slot_notify);
+                continue;
+            }
+
+            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d) clean_jobs=%d",
+                     (unsigned long)slot_notify,
+                     new_work->job_id,
+                     new_work->type,
+                     new_work->clean_jobs);
+
             current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
-            
-            // Initialiseer de versie vanuit de nieuwe job
+
             current_version = new_work->version;
 
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
@@ -54,16 +78,18 @@ void create_jobs_task(void *pvParameters)
             }
 
             if (!current_work->clean_jobs) {
-                continue;
+                ESP_LOGW(TAG, "clean_jobs=false, job %s wordt alsnog verzonden",
+                         current_work->job_id);
+                // GEEN continue: we willen de job alsnog naar de ASIC sturen
             }
         } else {
             if (current_work == NULL) {
-                vTaskDelay(100 / portTICK_PERIOD_MS);
+                vTaskDelay(pdMS_TO_TICKS(100));
                 continue;
             }
         }
 
-        bm_job *next_job = malloc(sizeof(bm_job));
+        bm_job *next_job = calloc(1, sizeof(bm_job));
         if (next_job == NULL) {
             ESP_LOGE(TAG, "Failed to allocate memory for new job");
             continue;
@@ -75,9 +101,20 @@ void create_jobs_task(void *pvParameters)
 
         memcpy(merkle_root, current_work->merkle_root, 32);
 
-        construct_bm_job_from_miner_job(current_work, current_version, merkle_root, version_mask, job_diff, GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates, next_job);
+        construct_bm_job_from_miner_job(current_work, current_version, merkle_root,
+                                        version_mask, job_diff,
+                                        GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates,
+                                        next_job);
+
+        if (current_work->job_id == NULL) {
+            ESP_LOGE(TAG, "current_work->job_id is NULL");
+            free(next_job);
+            continue;
+        }
+
         next_job->jobid = strdup(current_work->job_id);
-        next_job->extranonce2 = strdup(""); 
+        // Vaste 4-byte extranonce2 (8 hex tekens)
+        next_job->extranonce2 = strdup(FIXED_EXTRANONCE2);
 
         if (next_job->jobid == NULL || next_job->extranonce2 == NULL) {
             ESP_LOGE(TAG, "Failed to allocate job metadata");
@@ -95,17 +132,28 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
+        // Timing rond ASIC_send_work
+        uint64_t t0 = esp_timer_get_time();
         ASIC_send_work(GLOBAL_STATE, next_job);
+        uint64_t t1 = esp_timer_get_time();
+
+        ESP_LOGI(TAG, "Job verzonden: %s version=%08" PRIx32 " en2=%s (ASIC_send_work duurde %llu us)",
+                 next_job->jobid,
+                 current_version,
+                 next_job->extranonce2,
+                 (unsigned long long)(t1 - t0));
 
         if (!current_work_sent) {
             SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
         }
         current_work_sent = true;
 
-        // Version Rolling logica (geen extranonce2 ophoging meer)
-        uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
+        // Version rolling
+        uint32_t mask = (current_work->version_mask != 0)
+                            ? current_work->version_mask
+                            : BIP320_VERSION_ROLLING_MASK;
         uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
-        
+
         if (midstates > 0) {
             for (int i = 0; i < midstates; i++) {
                 current_version = increment_bitmask(current_version, mask);
