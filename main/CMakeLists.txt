@@ -1,227 +1,210 @@
-#include <sys/time.h>
-#include <limits.h>
-#include <string.h>
-#include <inttypes.h>
+idf_component_register(
+SRCS
+    "adc.c"
+    "i2c_bitaxe.c"
+    "main.c"
+    "log_buffer.c"
+    "nvs_config.c"
+    "display.c"
+    "screen.c"
+    "input.c"
+    "filesystem.c"
+    "system.c"
+    "lv_font_portfolio-6x8.c"
+    "logo.c"
+    "images/generated/bitaxe_background.c"
+    "images/generated/bitaxe_logo_large.c"
+    "images/fonts/ui_font_DigitalNumbers16.c"
+    "images/fonts/ui_font_DigitalNumbers28.c"
+    "images/fonts/ui_font_OpenSansBold13.c"
+    "images/fonts/ui_font_OpenSansBold14.c"
+    "images/fonts/ui_font_AngelWish40.c"
+    "./bap/bap.c"
+    "./bap/bap_protocol.c"
+    "./bap/bap_uart.c"
+    "./bap/bap_handlers.c"
+    "./bap/bap_subscription.c"
+    "device_pins.c"
+    "device_config.c"
+    "setup_ble.c"
+    "task_monitor.c"
+    "./http_server/http_server.c"
+    "./http_server/websocket.c"
+    "./http_server/websocket_log.c"
+    "./http_server/websocket_api.c"
+    "./http_server/cjson_utils.c"
+    "./http_server/system_api_json.c"
+    "./http_server/theme_api.c"
+    "./http_server/axe-os/api/system/asic_settings.c"
+    "./self_test/self_test.c"
+    "./tasks/stratum_task.c"
+    "./tasks/stratum_v1_client.c"
+    "./tasks/stratum_v2_client.c"
+    "./tasks/create_jobs_task.c"
+    "./tasks/asic_result_task.c"
+    "./tasks/power_management_task.c"
+    "./tasks/statistics_task.c"
+    "./tasks/scoreboard.c"
+    "./tasks/hashrate_monitor_task.c"
+    "./tasks/fan_controller_task.c"
+    "./thermal/EMC2101.c"
+    "./thermal/EMC2103.c"
+    "./thermal/EMC2302.c"
+    "./thermal/TMP1075.c"
+    "./thermal/thermal.c"
+    "./thermal/PID.c"
+    "./power/TPS546.c"
+    "./power/DS4432U.c"
+    "./power/INA260.c"
+    "./power/power.c"
+    "./power/vcore.c"
+    "./power/asic_reset.c"
+    "./power/asic_init.c"
+    "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.c"
 
-#include "work_queue.h"
-#include "global_state.h"
-#include "esp_log.h"
-#include "esp_system.h"
-#include "esp_random.h"
-#include "esp_timer.h"
-#include "esp_heap_caps.h"
+INCLUDE_DIRS
+    "."
+    "tasks"
+    "http_server"
+    "http_server/axe-os/api/system"
+    "self_test"
+    "bap"
+    "thermal"
+    "power"
+    "${CMAKE_CURRENT_BINARY_DIR}"
 
-#include "mining.h"
-#include "asic.h"
-#include "system.h"
-#include "stratum_api.h"
-#include "utils.h"
+REQUIRES
+    "asic"
+    "connect"
+    "dns_server"
+    "stratum"
+    "stratum_v2"
 
-static const char *TAG = "create_jobs_task";
+PRIV_REQUIRES
+    "app_update"
+    "esp_adc"
+    "esp_app_format"
+    "esp_driver_gpio"
+    "esp_event"
+    "esp_http_server"
+    "esp_lcd"
+    "esp_netif"
+    "esp_psram"
+    "esp_timer"
+    "esp_wifi"
+    "nvs_flash"
+    "spiffs"
+    "vfs"
+    "esp_driver_i2c"
+    "esp_driver_uart"
+    "tcp_transport"
+    "esp_mm"
+    "bt"
 
-#define MAX_EXTRANONCE2_LEN 32
-#define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
+EMBED_FILES "http_server/recovery_page.html"
+)
 
-// Oneven stapgrootte (Golden Ratio) → coprime met elke macht van 2,
-// dus volledige cyclus zonder duplicaten.
-#define EXTRANONCE2_STEP 0x9E3779B97F4A7C15ULL
+idf_build_set_property(COMPILE_OPTIONS "-DLV_CONF_INCLUDE_SIMPLE=1" APPEND)
+idf_build_set_property(COMPILE_OPTIONS "-DLV_CONF_PATH=\"${CMAKE_SOURCE_DIR}/main/lv_conf.h\"" APPEND)
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+set(WEB_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/http_server/axe-os")
 
-// Masker de teller zodat hij past binnen extranonce_2_len bytes.
-static inline uint64_t mask_extranonce2(uint64_t val, uint8_t len)
-{
-    if (len == 0) {
-        return 0;
-    }
-    if (len >= 8) {
-        return val;
-    }
-    uint64_t mask = (1ULL << (len * 8)) - 1ULL;
-    return val & mask;
-}
+if("$ENV{GITHUB_ACTIONS}" STREQUAL "true")
+    message(STATUS "Running on GitHub Actions. Web ui will be prebuilt.")
 
-// Genereer een random startwaarde binnen de toegestane ruimte.
-static inline uint64_t random_extranonce2(uint8_t len)
-{
-    if (len == 0) {
-        return 0;
-    }
-    uint64_t r = ((uint64_t)esp_random() << 32) | (uint64_t)esp_random();
-    return mask_extranonce2(r, len);
-}
+    add_custom_command(
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.c" "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.h"
+        COMMAND ${PYTHON} "${CMAKE_SOURCE_DIR}/tools/embed_web_ui.py"
+                "${WEB_SRC_DIR}/dist/axe-os"
+                "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.c"
+                "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.h"
+        DEPENDS "${CMAKE_SOURCE_DIR}/tools/embed_web_ui.py"
+        COMMENT "Generating embedded Web UI source files (CI)"
+        VERBATIM
+    )
 
-static void generate_work(GlobalState *GLOBAL_STATE,
-                          mining_notify *notification,
-                          uint64_t extranonce_2,
-                          double difficulty);
+    # Make the binary compile depend on the generated source file in CI
+    add_custom_target(web_ui_gen DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.c")
+    add_dependencies(${COMPONENT_LIB} web_ui_gen)
 
-// ---------------------------------------------------------------------------
-// Hoofdtaak
-// ---------------------------------------------------------------------------
 
-void create_jobs_task(void *pvParameters)
-{
-    GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
+else()
+    find_program(NPM_EXECUTABLE npm)
+    if(NOT NPM_EXECUTABLE AND NOT EXISTS ${WEB_SRC_DIR}/dist)
+        message(FATAL_ERROR "npm is not found! Please install it to proceed.")
+    endif()
 
-    double difficulty = GLOBAL_STATE->pool_difficulty;
+    # OpenAPI generation - only when openapi.yaml changes
+    set(OPENAPI_SPEC "${CMAKE_CURRENT_SOURCE_DIR}/http_server/openapi.yaml")
+    set(OPENAPI_STAMP "${CMAKE_BINARY_DIR}/openapi_generate.stamp")
 
-    mining_notify *current_work = NULL;
+    add_custom_command(
+        OUTPUT ${OPENAPI_STAMP}
+        COMMAND ${NPM_EXECUTABLE} i
+        COMMAND ${NPM_EXECUTABLE} run generate:api
+        COMMAND ${CMAKE_COMMAND} -E touch ${OPENAPI_STAMP}
+        WORKING_DIRECTORY ${WEB_SRC_DIR}
+        DEPENDS ${OPENAPI_SPEC}
+        COMMENT "Generating API client from OpenAPI spec (openapi.yaml changed)"
+        VERBATIM
+        USES_TERMINAL
+    )
 
-    uint8_t  last_extranonce_2_len = GLOBAL_STATE->extranonce_2_len;
-    uint64_t extranonce_2      = random_extranonce2(last_extranonce_2_len);
+    # Collect all frontend source files to track dependencies (excluding auto-generated code)
+    file(GLOB_RECURSE WEB_UI_SOURCES
+        "${WEB_SRC_DIR}/src/*.*"
+    )
+    list(FILTER WEB_UI_SOURCES EXCLUDE REGEX "/generated/")
 
-    ESP_LOGI(TAG, "ASIC Job Interval: %d ms",
-             ASIC_get_asic_job_frequency_ms(GLOBAL_STATE));
-    ESP_LOGI(TAG, "Extranonce2 step: 0x%016" PRIx64 ", len: %u bytes (modulus 2^%u)",
-             (uint64_t)EXTRANONCE2_STEP,
-             (unsigned)last_extranonce_2_len,
-             (unsigned)(last_extranonce_2_len * 8));
-    ESP_LOGI(TAG, "ASIC Ready!");
+    # Also track build configuration files
+    list(APPEND WEB_UI_SOURCES
+        "${WEB_SRC_DIR}/package.json"
+        "${WEB_SRC_DIR}/package-lock.json"
+        "${WEB_SRC_DIR}/angular.json"
+        "${WEB_SRC_DIR}/tsconfig.json"
+        "${WEB_SRC_DIR}/tsconfig.app.json"
+    )
 
-    while (1) {
-        // -------------------------------------------------------------------
-        // 1. Reset aanvragen verwerken (bv. bij reconnect of pool-wijziging)
-        // -------------------------------------------------------------------
-        if (GLOBAL_STATE->reset_extranonce2 ||
-            GLOBAL_STATE->extranonce_2_len != last_extranonce_2_len) {
+    # Use a stamp file to track when the build was last done
+    set(WEB_UI_STAMP "${CMAKE_BINARY_DIR}/web_ui_build.stamp")
+    # Track index.html.gz which is generated as part of the build
+    set(WEB_UI_OUTPUT "${WEB_SRC_DIR}/dist/axe-os/index.html.gz")
 
-            last_extranonce_2_len = GLOBAL_STATE->extranonce_2_len;
-            extranonce_2 = random_extranonce2(last_extranonce_2_len);
+    # Custom command that only runs when source files change
+    add_custom_command(
+        OUTPUT ${WEB_UI_STAMP} ${WEB_UI_OUTPUT}
+        COMMAND ${NPM_EXECUTABLE} i
+        COMMAND ${NPM_EXECUTABLE} run build:no-api-gen
+        COMMAND ${CMAKE_COMMAND} -E touch ${WEB_UI_STAMP}
+        WORKING_DIRECTORY ${WEB_SRC_DIR}
+        DEPENDS ${WEB_UI_SOURCES} ${OPENAPI_STAMP}
+        COMMENT "Building Web UI (source files changed)"
+        VERBATIM
+        USES_TERMINAL
+    )
 
-            ESP_LOGI(TAG, "Extranonce2 gereset naar 0x%016" PRIx64 " (len=%u)",
-                     extranonce_2, (unsigned)last_extranonce_2_len);
+    # Create a target for the web UI build
+    add_custom_target(web_ui_dist ALL
+        DEPENDS ${WEB_UI_STAMP} ${OPENAPI_STAMP}
+    )
 
-            GLOBAL_STATE->reset_extranonce2 = false;
-        }
+    add_dependencies(${COMPONENT_LIB} web_ui_dist)
 
-        // -------------------------------------------------------------------
-        // 2. Difficulty / version rolling direct verwerken (niet wachten op werk)
-        // -------------------------------------------------------------------
-        if (GLOBAL_STATE->new_set_mining_difficulty_msg) {
-            difficulty = GLOBAL_STATE->pool_difficulty;
-            GLOBAL_STATE->new_set_mining_difficulty_msg = false;
-            ESP_LOGI(TAG, "Nieuwe pool difficulty: %.2f", difficulty);
-        }
+    # Generate embedded C files from the build output directory
+    add_custom_command(
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.c" "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.h"
+        COMMAND ${PYTHON} "${CMAKE_SOURCE_DIR}/tools/embed_web_ui.py"
+                "${WEB_SRC_DIR}/dist/axe-os"
+                "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.c"
+                "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.h"
+        DEPENDS ${WEB_UI_STAMP} "${CMAKE_SOURCE_DIR}/tools/embed_web_ui.py"
+        COMMENT "Generating embedded Web UI source files"
+        VERBATIM
+    )
 
-        if (GLOBAL_STATE->new_stratum_version_rolling_msg && GLOBAL_STATE->ASIC_initalized) {
-            ESP_LOGI(TAG, "Set chip version rolls %i",
-                     (int)(GLOBAL_STATE->version_mask >> 13));
-            ASIC_set_version_mask(GLOBAL_STATE, GLOBAL_STATE->version_mask);
-            GLOBAL_STATE->new_stratum_version_rolling_msg = false;
-        }
+    # In local build, make the component depend on the generated file too
+    add_custom_target(web_ui_gen DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.c")
+    add_dependencies(${COMPONENT_LIB} web_ui_gen)
 
-        // -------------------------------------------------------------------
-        // 3. Wacht op nieuwe work (met resterende timeout)
-        // -------------------------------------------------------------------
-        int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
-        uint64_t start_us = esp_timer_get_time();
 
-        mining_notify *new_work =
-            queue_dequeue_timeout(&GLOBAL_STATE->stratum_queue, timeout_ms);
-
-        if (new_work != NULL) {
-            ESP_LOGI(TAG, "New Work Dequeued %s", new_work->job_id);
-
-            // Vervang oude work altijd (V1: nieuwe job is altijd leidend)
-            if (current_work != NULL) {
-                STRATUM_V1_free_mining_notify(current_work);
-            }
-            current_work = new_work;
-
-            // clean_jobs: bij V1 betekent false meestal "oude shares nog geldig".
-            // Wij sturen altijd direct de nieuwe job; alleen loggen als het afwijkt.
-            if (!current_work->clean_jobs) {
-                ESP_LOGD(TAG, "clean_jobs=false (job %s)", current_work->job_id);
-            }
-        } else {
-            // Geen nieuwe work: als we nog niets hebben, kort wachten en opnieuw
-            if (current_work == NULL) {
-                vTaskDelay(100 / portTICK_PERIOD_MS);
-                continue;
-            }
-            // Anders: blijf de huidige job heruitzenden met nieuwe extranonce2
-        }
-
-        // -------------------------------------------------------------------
-        // 4. ASIC nog niet klaar? Niet alloceren, kort wachten
-        // -------------------------------------------------------------------
-        if (!GLOBAL_STATE->ASIC_initalized) {
-            vTaskDelay(10 / portTICK_PERIOD_MS);
-            continue;
-        }
-
-        // -------------------------------------------------------------------
-        // 5. Werk genereren en naar ASIC sturen
-        // -------------------------------------------------------------------
-        ESP_LOGD(TAG, "Genereer werk: extranonce_2=0x%016" PRIx64 " (dec: %" PRIu64 ")",
-                 extranonce_2, extranonce_2);
-
-        generate_work(GLOBAL_STATE, current_work, extranonce_2, difficulty);
-
-        // Volgende extranonce2 (oneven stap → coprime met modulus)
-        extranonce_2 = mask_extranonce2(extranonce_2 + EXTRANONCE2_STEP,
-                                        GLOBAL_STATE->extranonce_2_len);
-
-        // Reset timeout voor de volgende iteratie (niet cumulatief)
-        int elapsed_ms = (int)((esp_timer_get_time() - start_us) / 1000);
-        (void)elapsed_ms; // huidige iteratie is klaar, timeout wordt bovenaan opnieuw bepaald
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Werk genereren voor Stratum V1
-// ---------------------------------------------------------------------------
-
-static void generate_work(GlobalState *GLOBAL_STATE,
-                          mining_notify *notification,
-                          uint64_t extranonce_2,
-                          double difficulty)
-{
-    if (GLOBAL_STATE->extranonce_2_len > MAX_EXTRANONCE2_LEN) {
-        ESP_LOGE(TAG, "extranonce_2_len %d exceeds maximum %d, skipping job",
-                 GLOBAL_STATE->extranonce_2_len, MAX_EXTRANONCE2_LEN);
-        return;
-    }
-
-    char extranonce_2_str[MAX_EXTRANONCE2_STR];
-    extranonce_2_generate(extranonce_2, GLOBAL_STATE->extranonce_2_len, extranonce_2_str);
-
-    uint8_t coinbase_tx_hash[32];
-    calculate_coinbase_tx_hash(notification->coinbase_1,
-                               notification->coinbase_2,
-                               GLOBAL_STATE->extranonce_str,
-                               extranonce_2_str,
-                               coinbase_tx_hash);
-
-    uint8_t merkle_root[32];
-    calculate_merkle_root_hash(coinbase_tx_hash,
-                               (uint8_t(*)[32])notification->merkle_branches,
-                               notification->n_merkle_branches,
-                               merkle_root);
-
-    bm_job *next_job = calloc(1, sizeof(bm_job));
-    if (next_job == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate memory for new job");
-        return;
-    }
-
-    construct_bm_job(notification, merkle_root, GLOBAL_STATE->version_mask,
-                     difficulty, next_job);
-
-    next_job->extranonce2 = strdup(extranonce_2_str);
-    next_job->jobid      = strdup(notification->job_id);
-    next_job->version_mask = GLOBAL_STATE->version_mask;
-
-    if (next_job->extranonce2 == NULL || next_job->jobid == NULL) {
-        ESP_LOGE(TAG, "strdup failed for job fields");
-        free(next_job->extranonce2);
-        free(next_job->jobid);
-        free(next_job);
-        return;
-    }
-
-    ASIC_send_work(GLOBAL_STATE, next_job);
-}
+endif()
