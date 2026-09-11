@@ -17,7 +17,7 @@
 
 static const char *TAG = "create_jobs_task";
 
-// Vaste extranonce2: 4 bytes, allemaal nul
+// Vaste extranonce2: 4 bytes, allemaal nul (8 hex tekens)
 #define FIXED_EXTRANONCE2 "00000000"
 
 void create_jobs_task(void *pvParameters)
@@ -37,7 +37,7 @@ void create_jobs_task(void *pvParameters)
         uint64_t start_time = esp_timer_get_time();
         uint32_t slot_notify = 0;
 
-        // Clamp timeout: nooit negatief
+        // Voorkom negatieve timeout (busy-loop)
         if (timeout_ms < 0) {
             timeout_ms = 0;
         }
@@ -69,6 +69,7 @@ void create_jobs_task(void *pvParameters)
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
 
+            // Initialiseer versie vanuit de nieuwe job
             current_version = new_work->version;
 
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
@@ -80,7 +81,7 @@ void create_jobs_task(void *pvParameters)
             if (!current_work->clean_jobs) {
                 ESP_LOGW(TAG, "clean_jobs=false, job %s wordt alsnog verzonden",
                          current_work->job_id);
-                // GEEN continue: we willen de job alsnog naar de ASIC sturen
+                // GEEN continue: job wordt alsnog naar de ASIC gestuurd
             }
         } else {
             if (current_work == NULL) {
@@ -101,17 +102,16 @@ void create_jobs_task(void *pvParameters)
 
         memcpy(merkle_root, current_work->merkle_root, 32);
 
-        construct_bm_job_from_miner_job(current_work, current_version, merkle_root,
-                                        version_mask, job_diff,
+        construct_bm_job_from_miner_job(current_work,
+                                        current_version,
+                                        merkle_root,
+                                        version_mask,
+                                        job_diff,
                                         GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates,
                                         next_job);
 
-        if (current_work->job_id == NULL) {
-            ESP_LOGE(TAG, "current_work->job_id is NULL");
-            free(next_job);
-            continue;
-        }
-
+        // LET OP: geen NULL-check op current_work->job_id.
+        // Als job_id een array is (char[]), geeft dat -Werror=address op GCC 12+.
         next_job->jobid = strdup(current_work->job_id);
         // Vaste 4-byte extranonce2 (8 hex tekens)
         next_job->extranonce2 = strdup(FIXED_EXTRANONCE2);
@@ -132,12 +132,13 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        // Timing rond ASIC_send_work
+        // Timing rond ASIC_send_work, zodat je ziet waar de vertraging zit
         uint64_t t0 = esp_timer_get_time();
         ASIC_send_work(GLOBAL_STATE, next_job);
         uint64_t t1 = esp_timer_get_time();
 
-        ESP_LOGI(TAG, "Job verzonden: %s version=%08" PRIx32 " en2=%s (ASIC_send_work duurde %llu us)",
+        ESP_LOGI(TAG,
+                 "Job verzonden: %s version=%08" PRIx32 " en2=%s (ASIC_send_work duurde %llu us)",
                  next_job->jobid,
                  current_version,
                  next_job->extranonce2,
@@ -148,7 +149,7 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // Version rolling
+        // Version rolling (geen extranonce2 ophoging)
         uint32_t mask = (current_work->version_mask != 0)
                             ? current_work->version_mask
                             : BIP320_VERSION_ROLLING_MASK;
