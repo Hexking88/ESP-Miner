@@ -27,11 +27,13 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
 static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty, uint64_t extranonce_2_counter);
 
-// Oneven stapgroottes per extranonce2-lengte (copriem met 2^(8*len))
+/* Oneven stapgroottes afgestemd op de werkelijke extranonce2-lengte.
+ * Altijd oneven, dus copriem met 2^(8*len) → volledige cyclus zonder duplicaten. */
 static inline uint64_t get_extranonce2_step(uint8_t len)
 {
     switch (len) {
-        case 1:  return 0x9DULL;
+        case 0:  return 0;                        /* geen extranonce2 → geen stap */
+        case 1:  return 0x9DULL;                  /* 157 */
         case 2:  return 0x9E37ULL;
         case 3:  return 0x9E3779ULL;
         case 4:  return 0x9E3779B9ULL;
@@ -43,27 +45,27 @@ static inline uint64_t get_extranonce2_step(uint8_t len)
     }
 }
 
-// Pas maskering toe zodat de counter niet groter wordt dan toegestaan door de pool
+/* Maskeren zodat de counter binnen het door de pool toegestane bereik blijft. */
 static inline uint64_t mask_extranonce2(uint64_t val, uint8_t len)
 {
-    if (len >= 8) {
-        return val;
-    }
     if (len == 0) {
         return 0;
+    }
+    if (len >= 8) {
+        return val;
     }
     uint64_t mask = (1ULL << (len * 8)) - 1ULL;
     return val & mask;
 }
 
-// Willekeurige startwaarde om hergebruik na reboot te voorkomen
+/* Willekeurige startwaarde om hergebruik na reboot / reconnect te voorkomen. */
 static inline uint64_t random_extranonce2(uint8_t len)
 {
     uint64_t r = ((uint64_t)esp_random() << 32) | esp_random();
     return mask_extranonce2(r, len);
 }
 
-// Free a work item using the correct free function for the protocol it was created under
+/* Vrijgeven van werk met het juiste protocol. */
 static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protocol_t protocol)
 {
     if (!work) return;
@@ -71,7 +73,7 @@ static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protoc
         if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
             sv2_ext_job_free((sv2_ext_job_t *)work);
         } else {
-            free(work);
+            free(work);  /* sv2_job_t is flat */
         }
     } else {
         STRATUM_V1_free_mining_notify(work);
@@ -86,20 +88,21 @@ void create_jobs_task(void *pvParameters)
     void *current_work = NULL;
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
 
-    // Validatie: extranonce_2_len moet > 0 zijn, anders kunnen we geen unieke werk genereren
+    /* Validatie van extranonce2-lengte — 0 betekent duplicate work. */
     if (GLOBAL_STATE->extranonce_2_len == 0) {
-        ESP_LOGW(TAG, "extranonce_2_len is 0; pools zonder extranonce2 leveren duplicate work op. "
-                      "Mijnwerker zal doorgaan maar shares kunnen geweigerd worden.");
+        ESP_LOGW(TAG, "extranonce_2_len = 0; pool levert geen ruimte voor unieke work. "
+                      "Shares kunnen geweigerd worden wegens duplicaten.");
     }
     if (GLOBAL_STATE->extranonce_2_len > MAX_EXTRANONCE2_LEN) {
-        ESP_LOGE(TAG, "extranonce_2_len %d > MAX %d", GLOBAL_STATE->extranonce_2_len, MAX_EXTRANONCE2_LEN);
+        ESP_LOGE(TAG, "extranonce_2_len %u > MAX %d, jobs worden overgeslagen",
+                 GLOBAL_STATE->extranonce_2_len, MAX_EXTRANONCE2_LEN);
     }
 
-    // Willekeurige startwaarde zodat we na reboot niet dezelfde reeks hergebruiken
-    uint64_t extranonce_2 = random_extranonce2(GLOBAL_STATE->extranonce_2_len);
+    /* Willekeurige startwaarde i.p.v. altijd 0. */
+    uint64_t extranonce_2      = random_extranonce2(GLOBAL_STATE->extranonce_2_len);
     uint64_t extranonce_2_step = get_extranonce2_step(GLOBAL_STATE->extranonce_2_len);
 
-    ESP_LOGI(TAG, "Stapgrootte voor extranonce2 (len=%u): 0x%llx, start=0x%llx",
+    ESP_LOGI(TAG, "extranonce2 stap: len=%u stap=0x%llx start=0x%llx",
              GLOBAL_STATE->extranonce_2_len,
              (unsigned long long)extranonce_2_step,
              (unsigned long long)extranonce_2);
@@ -109,19 +112,20 @@ void create_jobs_task(void *pvParameters)
     ESP_LOGI(TAG, "ASIC Ready!");
 
     while (1) {
-        // Reset aanvraag vanuit stratum-taak
+        /* Reset-aanvraag vanuit stratum-taak */
         if (GLOBAL_STATE->reset_extranonce2) {
-            extranonce_2 = random_extranonce2(GLOBAL_STATE->extranonce_2_len);
+            extranonce_2      = random_extranonce2(GLOBAL_STATE->extranonce_2_len);
             extranonce_2_step = get_extranonce2_step(GLOBAL_STATE->extranonce_2_len);
-            ESP_LOGI(TAG, "Reset extranonce2. Nieuwe start=0x%llx, stap=0x%llx",
+            ESP_LOGI(TAG, "Reset extranonce2: start=0x%llx stap=0x%llx",
                      (unsigned long long)extranonce_2,
                      (unsigned long long)extranonce_2_step);
             GLOBAL_STATE->reset_extranonce2 = false;
         }
 
+        /* Protocol dynamisch lezen (coordinator kan geswitcht zijn). */
         stratum_protocol_t active_protocol = GLOBAL_STATE->stratum_protocol;
 
-        // Protocol-switch: gooi huidige werk weg (hoort bij oud protocol)
+        /* Protocol-switch: huidige werk hoort bij oud protocol → weggooien. */
         if (active_protocol != current_work_protocol) {
             if (current_work != NULL) {
                 ESP_LOGI(TAG, "Protocol switch %s -> %s, huidige werk weggegooid",
@@ -137,6 +141,7 @@ void create_jobs_task(void *pvParameters)
         uint64_t start_time = esp_timer_get_time();
         void *new_work = queue_dequeue_timeout(&GLOBAL_STATE->stratum_queue, timeout_ms);
 
+        /* Timeout-aftrek met clamp op 0 (voorkomt negatieve timeout / busy loop). */
         int elapsed_ms = (int)((esp_timer_get_time() - start_time) / 1000);
         if (elapsed_ms >= timeout_ms) {
             timeout_ms = 0;
@@ -147,13 +152,13 @@ void create_jobs_task(void *pvParameters)
         if (new_work != NULL) {
             active_protocol = GLOBAL_STATE->stratum_protocol;
 
-            // Vrijgeven van vorige werk (met het protocol waaronder het gemaakt is)
+            /* Vrijgeven van vorige werk met het protocol waaronder het gemaakt is. */
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
             current_work = NULL;
 
             if (active_protocol != current_work_protocol) {
-                // Item was geënqueued onder oud protocol (of nieuw — onzeker).
-                // Gebruik het protocol dat actief was tijdens dequeue (current_work_protocol = oud)
+                /* Item is vrijwel zeker onder het OUDE protocol geënqueued
+                 * (we detecteren de switch net). Vrijgeven met oud protocol. */
                 ESP_LOGW(TAG, "Protocol-switch tijdens dequeue; item weggegooid");
                 free_work_item(GLOBAL_STATE, new_work, current_work_protocol);
                 current_work_protocol = active_protocol;
@@ -163,12 +168,15 @@ void create_jobs_task(void *pvParameters)
 
             if (current_work_protocol == STRATUM_PROTOCOL_V2) {
                 if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
-                    ESP_LOGI(TAG, "New Work Dequeued SV2 ext job %lu", ((sv2_ext_job_t *)new_work)->job_id);
+                    ESP_LOGI(TAG, "New Work Dequeued SV2 ext job %lu",
+                             ((sv2_ext_job_t *)new_work)->job_id);
                 } else {
-                    ESP_LOGI(TAG, "New Work Dequeued SV2 job %lu", ((sv2_job_t *)new_work)->job_id);
+                    ESP_LOGI(TAG, "New Work Dequeued SV2 job %lu",
+                             ((sv2_job_t *)new_work)->job_id);
                 }
             } else {
-                ESP_LOGI(TAG, "New Work Dequeued %s", ((mining_notify *)new_work)->job_id);
+                ESP_LOGI(TAG, "New Work Dequeued %s",
+                         ((mining_notify *)new_work)->job_id);
             }
 
             current_work = new_work;
@@ -180,13 +188,14 @@ void create_jobs_task(void *pvParameters)
             }
 
             if (GLOBAL_STATE->new_stratum_version_rolling_msg && GLOBAL_STATE->ASIC_initalized) {
-                ESP_LOGI(TAG, "Set chip version rolls %i", (int)(GLOBAL_STATE->version_mask >> 13));
+                ESP_LOGI(TAG, "Set chip version rolls %i",
+                         (int)(GLOBAL_STATE->version_mask >> 13));
                 ASIC_set_version_mask(GLOBAL_STATE, GLOBAL_STATE->version_mask);
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
 
-            // clean_jobs: alleen gebruiken om te bepalen of oude shares nog geldig zijn.
-            // We genereren ALTIJD werk, ook bij clean=false.
+            /* clean_jobs alleen gebruiken om te weten of oude shares nog geldig
+             * zijn. We genereren ALTIJD werk — ook bij clean=false. */
             bool clean;
             if (current_work_protocol == STRATUM_PROTOCOL_V2) {
                 if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
@@ -199,7 +208,7 @@ void create_jobs_task(void *pvParameters)
             }
             if (!clean) {
                 ESP_LOGD(TAG, "Non-clean job; werk wordt alsnog gegenereerd");
-                // GEEN continue — gewoon doorgaan
+                /* GEEN continue — we willen de nieuwe template minen. */
             }
         } else {
             if (current_work == NULL) {
@@ -207,13 +216,14 @@ void create_jobs_task(void *pvParameters)
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
-            if (active_protocol == STRATUM_PROTOCOL_V2 && !stratum_v2_is_extended_channel(GLOBAL_STATE)) {
+            if (active_protocol == STRATUM_PROTOCOL_V2 &&
+                !stratum_v2_is_extended_channel(GLOBAL_STATE)) {
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
         }
 
-        // Protocol opnieuw lezen; switch kan gebeurd zijn
+        /* Protocol opnieuw lezen — switch kan gebeurd zijn tijdens timeout. */
         active_protocol = GLOBAL_STATE->stratum_protocol;
         if (active_protocol != current_work_protocol) {
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
@@ -224,28 +234,38 @@ void create_jobs_task(void *pvParameters)
         }
 
         ESP_LOGI(TAG, "Genereren werk: extranonce_2 = 0x%llx (dec: %llu)",
-                 (unsigned long long)extranonce_2, (unsigned long long)extranonce_2);
+                 (unsigned long long)extranonce_2,
+                 (unsigned long long)extranonce_2);
 
         if (active_protocol == STRATUM_PROTOCOL_V2) {
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
-                generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty, extranonce_2);
-                extranonce_2 = mask_extranonce2(extranonce_2 + extranonce_2_step, GLOBAL_STATE->extranonce_2_len);
+                generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work,
+                                      difficulty, extranonce_2);
+                extranonce_2 = mask_extranonce2(extranonce_2 + extranonce_2_step,
+                                                GLOBAL_STATE->extranonce_2_len);
             } else {
                 generate_work_sv2(GLOBAL_STATE, (sv2_job_t *)current_work, difficulty);
             }
         } else {
-            generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty);
-            extranonce_2 = mask_extranonce2(extranonce_2 + extranonce_2_step, GLOBAL_STATE->extranonce_2_len);
+            generate_work(GLOBAL_STATE, (mining_notify *)current_work,
+                          extranonce_2, difficulty);
+            extranonce_2 = mask_extranonce2(extranonce_2 + extranonce_2_step,
+                                            GLOBAL_STATE->extranonce_2_len);
         }
 
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
 
-static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty)
+/* ------------------------------------------------------------------------- */
+/*                              SV1 werk                                     */
+/* ------------------------------------------------------------------------- */
+static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification,
+                          uint64_t extranonce_2, double difficulty)
 {
     if (GLOBAL_STATE->extranonce_2_len > MAX_EXTRANONCE2_LEN) {
-        ESP_LOGE(TAG, "extranonce_2_len %d exceeds maximum %d, skipping job", GLOBAL_STATE->extranonce_2_len, MAX_EXTRANONCE2_LEN);
+        ESP_LOGE(TAG, "extranonce_2_len %u > MAX %d, job overgeslagen",
+                 GLOBAL_STATE->extranonce_2_len, MAX_EXTRANONCE2_LEN);
         return;
     }
 
@@ -253,23 +273,27 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
     extranonce_2_generate(extranonce_2, GLOBAL_STATE->extranonce_2_len, extranonce_2_str);
 
     uint8_t coinbase_tx_hash[32];
-    calculate_coinbase_tx_hash(notification->coinbase_1, notification->coinbase_2, GLOBAL_STATE->extranonce_str, extranonce_2_str, coinbase_tx_hash);
+    calculate_coinbase_tx_hash(notification->coinbase_1, notification->coinbase_2,
+                               GLOBAL_STATE->extranonce_str, extranonce_2_str,
+                               coinbase_tx_hash);
 
     uint8_t merkle_root[32];
-    calculate_merkle_root_hash(coinbase_tx_hash, (uint8_t(*)[32])notification->merkle_branches, notification->n_merkle_branches, merkle_root);
+    calculate_merkle_root_hash(coinbase_tx_hash,
+                               (uint8_t(*)[32])notification->merkle_branches,
+                               notification->n_merkle_branches, merkle_root);
 
     bm_job *next_job = malloc(sizeof(bm_job));
     if (next_job == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for new job");
         return;
     }
-    // Belangrijk: voorkom dat we op onvoldoende geïnitialiseerde velden vrijgeven
-    memset(next_job, 0, sizeof(bm_job));
+    memset(next_job, 0, sizeof(bm_job));   /* pointers NULL → veilig vrijgeven */
 
-    construct_bm_job(notification, merkle_root, GLOBAL_STATE->version_mask, difficulty, next_job);
+    construct_bm_job(notification, merkle_root, GLOBAL_STATE->version_mask,
+                     difficulty, next_job);
 
-    next_job->extranonce2 = strdup(extranonce_2_str);
-    next_job->jobid = strdup(notification->job_id);
+    next_job->extranonce2  = strdup(extranonce_2_str);
+    next_job->jobid        = strdup(notification->job_id);
     next_job->version_mask = GLOBAL_STATE->version_mask;
 
     if (next_job->extranonce2 == NULL || next_job->jobid == NULL) {
@@ -282,6 +306,200 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
 
     if (!GLOBAL_STATE->ASIC_initalized) {
         ESP_LOGW(TAG, "ASIC not initialized, skipping job send");
+        free(next_job->jobid);
+        free(next_job->extranonce2);
+        free(next_job);
+        return;
+    }
+
+    ASIC_send_work(GLOBAL_STATE, next_job);
+}
+
+/* ------------------------------------------------------------------------- */
+/*                              SV2 werk                                     */
+/* ------------------------------------------------------------------------- */
+static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job,
+                              double difficulty)
+{
+    bm_job *next_job = malloc(sizeof(bm_job));
+    if (next_job == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for new SV2 job");
+        return;
+    }
+    memset(next_job, 0, sizeof(bm_job));
+
+    uint32_t version_mask = GLOBAL_STATE->version_mask;
+
+    next_job->version        = sv2_job->version;
+    next_job->target         = sv2_job->nbits;
+    next_job->ntime          = sv2_job->ntime;
+    next_job->starting_nonce = 0;
+    next_job->pool_diff      = difficulty;
+
+    reverse_32bit_words(sv2_job->merkle_root, next_job->merkle_root);
+    reverse_32bit_words(sv2_job->prev_hash,   next_job->prev_block_hash);
+
+    uint8_t midstate_data[64];
+    uint32_t base_version = sv2_job->version;
+    memcpy(midstate_data,     &base_version,        4);
+    memcpy(midstate_data + 4, sv2_job->prev_hash,   32);
+    memcpy(midstate_data + 36, sv2_job->merkle_root, 28);
+
+    uint8_t midstate[32];
+    midstate_sha256_bin(midstate_data, 64, midstate);
+    reverse_32bit_words(midstate, next_job->midstate);
+
+    if (version_mask != 0) {
+        uint32_t rolled_version = increment_bitmask(base_version, version_mask);
+        memcpy(midstate_data, &rolled_version, 4);
+        midstate_sha256_bin(midstate_data, 64, midstate);
+        reverse_32bit_words(midstate, next_job->midstate1);
+
+        rolled_version = increment_bitmask(rolled_version, version_mask);
+        memcpy(midstate_data, &rolled_version, 4);
+        midstate_sha256_bin(midstate_data, 64, midstate);
+        reverse_32bit_words(midstate, next_job->midstate2);
+
+        rolled_version = increment_bitmask(rolled_version, version_mask);
+        memcpy(midstate_data, &rolled_version, 4);
+        midstate_sha256_bin(midstate_data, 64, midstate);
+        reverse_32bit_words(midstate, next_job->midstate3);
+        next_job->num_midstates = 4;
+    } else {
+        next_job->num_midstates = 1;
+    }
+
+    char jobid_str[16];
+    snprintf(jobid_str, sizeof(jobid_str), "%" PRIu32, sv2_job->job_id);
+    next_job->jobid        = strdup(jobid_str);
+    next_job->extranonce2  = strdup("");
+    next_job->version_mask = version_mask;
+
+    if (next_job->jobid == NULL || next_job->extranonce2 == NULL) {
+        ESP_LOGE(TAG, "strdup gefaald bij SV2 job");
+        free(next_job->jobid);
+        free(next_job->extranonce2);
+        free(next_job);
+        return;
+    }
+
+    if (!GLOBAL_STATE->ASIC_initalized) {
+        ESP_LOGW(TAG, "ASIC not initialized, skipping SV2 job send");
+        free(next_job->jobid);
+        free(next_job->extranonce2);
+        free(next_job);
+        return;
+    }
+
+    ASIC_send_work(GLOBAL_STATE, next_job);
+}
+
+static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_job,
+                                  double difficulty, uint64_t extranonce_2_counter)
+{
+    sv2_conn_t *conn = GLOBAL_STATE->sv2_conn;
+    if (!conn) return;
+
+    /* Zelfde lengte-validatie als in SV1-pad. */
+    if (conn->extranonce_size > MAX_EXTRANONCE2_LEN) {
+        ESP_LOGE(TAG, "SV2 extranonce_size %u > MAX %d, job overgeslagen",
+                 conn->extranonce_size, MAX_EXTRANONCE2_LEN);
+        return;
+    }
+    if (conn->extranonce_size == 0) {
+        ESP_LOGW(TAG, "SV2 extranonce_size = 0; duplicate work mogelijk");
+    }
+
+    bm_job *next_job = malloc(sizeof(bm_job));
+    if (!next_job) {
+        ESP_LOGE(TAG, "Failed to allocate memory for SV2 ext job");
+        return;
+    }
+    memset(next_job, 0, sizeof(bm_job));
+
+    uint32_t version_mask = GLOBAL_STATE->version_mask;
+
+    uint8_t extranonce_2_len = conn->extranonce_size;
+    uint8_t extranonce_2[32];
+    memset(extranonce_2, 0, sizeof(extranonce_2));
+
+    uint64_t temp_counter = extranonce_2_counter;
+    for (int i = extranonce_2_len - 1; i >= 0 && temp_counter > 0; i--) {
+        extranonce_2[i] = (uint8_t)(temp_counter & 0xFF);
+        temp_counter >>= 8;
+    }
+
+    uint8_t coinbase_tx_hash[32];
+    calculate_coinbase_tx_hash_bin(
+        ext_job->coinbase_prefix, ext_job->coinbase_prefix_len,
+        conn->extranonce_prefix,  conn->extranonce_prefix_len,
+        extranonce_2,             extranonce_2_len,
+        ext_job->coinbase_suffix, ext_job->coinbase_suffix_len,
+        coinbase_tx_hash);
+
+    uint8_t merkle_root[32];
+    calculate_merkle_root_hash(coinbase_tx_hash,
+                               (const uint8_t (*)[32])ext_job->merkle_path,
+                               ext_job->merkle_path_count, merkle_root);
+
+    next_job->version        = ext_job->version;
+    next_job->target         = ext_job->nbits;
+    next_job->ntime          = ext_job->ntime;
+    next_job->starting_nonce = 0;
+    next_job->pool_diff      = difficulty;
+
+    reverse_32bit_words(merkle_root,        next_job->merkle_root);
+    reverse_32bit_words(ext_job->prev_hash, next_job->prev_block_hash);
+
+    uint8_t midstate_data[64];
+    uint32_t base_version = ext_job->version;
+    memcpy(midstate_data,     &base_version,      4);
+    memcpy(midstate_data + 4, ext_job->prev_hash, 32);
+    memcpy(midstate_data + 36, merkle_root,       28);
+
+    uint8_t midstate[32];
+    midstate_sha256_bin(midstate_data, 64, midstate);
+    reverse_32bit_words(midstate, next_job->midstate);
+
+    if (version_mask != 0) {
+        uint32_t rolled_version = increment_bitmask(base_version, version_mask);
+        memcpy(midstate_data, &rolled_version, 4);
+        midstate_sha256_bin(midstate_data, 64, midstate);
+        reverse_32bit_words(midstate, next_job->midstate1);
+
+        rolled_version = increment_bitmask(rolled_version, version_mask);
+        memcpy(midstate_data, &rolled_version, 4);
+        midstate_sha256_bin(midstate_data, 64, midstate);
+        reverse_32bit_words(midstate, next_job->midstate2);
+
+        rolled_version = increment_bitmask(rolled_version, version_mask);
+        memcpy(midstate_data, &rolled_version, 4);
+        midstate_sha256_bin(midstate_data, 64, midstate);
+        reverse_32bit_words(midstate, next_job->midstate3);
+        next_job->num_midstates = 4;
+    } else {
+        next_job->num_midstates = 1;
+    }
+
+    char jobid_str[16];
+    snprintf(jobid_str, sizeof(jobid_str), "%" PRIu32, ext_job->job_id);
+    next_job->jobid = strdup(jobid_str);
+
+    char en2_hex[65];
+    bin2hex(extranonce_2, extranonce_2_len, en2_hex, sizeof(en2_hex));
+    next_job->extranonce2  = strdup(en2_hex);
+    next_job->version_mask = version_mask;
+
+    if (next_job->jobid == NULL || next_job->extranonce2 == NULL) {
+        ESP_LOGE(TAG, "strdup gefaald bij SV2 ext job");
+        free(next_job->jobid);
+        free(next_job->extranonce2);
+        free(next_job);
+        return;
+    }
+
+    if (!GLOBAL_STATE->ASIC_initalized) {
+        ESP_LOGW(TAG, "ASIC not initialized, skipping SV2 ext job send");
         free(next_job->jobid);
         free(next_job->extranonce2);
         free(next_job);
