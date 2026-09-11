@@ -1,5 +1,6 @@
 #include <sys/time.h>
 #include <limits.h>
+#include <inttypes.h>
 
 #include "work_queue.h"
 #include "global_state.h"
@@ -27,13 +28,11 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
 static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty, uint64_t extranonce_2_counter);
 
-/* Oneven stapgroottes afgestemd op de werkelijke extranonce2-lengte.
- * Altijd oneven, dus copriem met 2^(8*len) → volledige cyclus zonder duplicaten. */
 static inline uint64_t get_extranonce2_step(uint8_t len)
 {
     switch (len) {
-        case 0:  return 0;                        /* geen extranonce2 → geen stap */
-        case 1:  return 0x9DULL;                  /* 157 */
+        case 0:  return 0;
+        case 1:  return 0x9DULL;
         case 2:  return 0x9E37ULL;
         case 3:  return 0x9E3779ULL;
         case 4:  return 0x9E3779B9ULL;
@@ -45,7 +44,6 @@ static inline uint64_t get_extranonce2_step(uint8_t len)
     }
 }
 
-/* Maskeren zodat de counter binnen het door de pool toegestane bereik blijft. */
 static inline uint64_t mask_extranonce2(uint64_t val, uint8_t len)
 {
     if (len == 0) {
@@ -58,14 +56,12 @@ static inline uint64_t mask_extranonce2(uint64_t val, uint8_t len)
     return val & mask;
 }
 
-/* Willekeurige startwaarde om hergebruik na reboot / reconnect te voorkomen. */
 static inline uint64_t random_extranonce2(uint8_t len)
 {
     uint64_t r = ((uint64_t)esp_random() << 32) | esp_random();
     return mask_extranonce2(r, len);
 }
 
-/* Vrijgeven van werk met het juiste protocol. */
 static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protocol_t protocol)
 {
     if (!work) return;
@@ -73,7 +69,7 @@ static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protoc
         if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
             sv2_ext_job_free((sv2_ext_job_t *)work);
         } else {
-            free(work);  /* sv2_job_t is flat */
+            free(work);
         }
     } else {
         STRATUM_V1_free_mining_notify(work);
@@ -88,7 +84,6 @@ void create_jobs_task(void *pvParameters)
     void *current_work = NULL;
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
 
-    /* Validatie van extranonce2-lengte — 0 betekent duplicate work. */
     if (GLOBAL_STATE->extranonce_2_len == 0) {
         ESP_LOGW(TAG, "extranonce_2_len = 0; pool levert geen ruimte voor unieke work. "
                       "Shares kunnen geweigerd worden wegens duplicaten.");
@@ -98,7 +93,6 @@ void create_jobs_task(void *pvParameters)
                  GLOBAL_STATE->extranonce_2_len, MAX_EXTRANONCE2_LEN);
     }
 
-    /* Willekeurige startwaarde i.p.v. altijd 0. */
     uint64_t extranonce_2      = random_extranonce2(GLOBAL_STATE->extranonce_2_len);
     uint64_t extranonce_2_step = get_extranonce2_step(GLOBAL_STATE->extranonce_2_len);
 
@@ -112,7 +106,6 @@ void create_jobs_task(void *pvParameters)
     ESP_LOGI(TAG, "ASIC Ready!");
 
     while (1) {
-        /* Reset-aanvraag vanuit stratum-taak */
         if (GLOBAL_STATE->reset_extranonce2) {
             extranonce_2      = random_extranonce2(GLOBAL_STATE->extranonce_2_len);
             extranonce_2_step = get_extranonce2_step(GLOBAL_STATE->extranonce_2_len);
@@ -122,10 +115,8 @@ void create_jobs_task(void *pvParameters)
             GLOBAL_STATE->reset_extranonce2 = false;
         }
 
-        /* Protocol dynamisch lezen (coordinator kan geswitcht zijn). */
         stratum_protocol_t active_protocol = GLOBAL_STATE->stratum_protocol;
 
-        /* Protocol-switch: huidige werk hoort bij oud protocol → weggooien. */
         if (active_protocol != current_work_protocol) {
             if (current_work != NULL) {
                 ESP_LOGI(TAG, "Protocol switch %s -> %s, huidige werk weggegooid",
@@ -141,7 +132,6 @@ void create_jobs_task(void *pvParameters)
         uint64_t start_time = esp_timer_get_time();
         void *new_work = queue_dequeue_timeout(&GLOBAL_STATE->stratum_queue, timeout_ms);
 
-        /* Timeout-aftrek met clamp op 0 (voorkomt negatieve timeout / busy loop). */
         int elapsed_ms = (int)((esp_timer_get_time() - start_time) / 1000);
         if (elapsed_ms >= timeout_ms) {
             timeout_ms = 0;
@@ -152,13 +142,10 @@ void create_jobs_task(void *pvParameters)
         if (new_work != NULL) {
             active_protocol = GLOBAL_STATE->stratum_protocol;
 
-            /* Vrijgeven van vorige werk met het protocol waaronder het gemaakt is. */
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
             current_work = NULL;
 
             if (active_protocol != current_work_protocol) {
-                /* Item is vrijwel zeker onder het OUDE protocol geënqueued
-                 * (we detecteren de switch net). Vrijgeven met oud protocol. */
                 ESP_LOGW(TAG, "Protocol-switch tijdens dequeue; item weggegooid");
                 free_work_item(GLOBAL_STATE, new_work, current_work_protocol);
                 current_work_protocol = active_protocol;
@@ -194,8 +181,6 @@ void create_jobs_task(void *pvParameters)
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
 
-            /* clean_jobs alleen gebruiken om te weten of oude shares nog geldig
-             * zijn. We genereren ALTIJD werk — ook bij clean=false. */
             bool clean;
             if (current_work_protocol == STRATUM_PROTOCOL_V2) {
                 if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
@@ -208,7 +193,6 @@ void create_jobs_task(void *pvParameters)
             }
             if (!clean) {
                 ESP_LOGD(TAG, "Non-clean job; werk wordt alsnog gegenereerd");
-                /* GEEN continue — we willen de nieuwe template minen. */
             }
         } else {
             if (current_work == NULL) {
@@ -223,7 +207,6 @@ void create_jobs_task(void *pvParameters)
             }
         }
 
-        /* Protocol opnieuw lezen — switch kan gebeurd zijn tijdens timeout. */
         active_protocol = GLOBAL_STATE->stratum_protocol;
         if (active_protocol != current_work_protocol) {
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
@@ -257,9 +240,6 @@ void create_jobs_task(void *pvParameters)
     }
 }
 
-/* ------------------------------------------------------------------------- */
-/*                              SV1 werk                                     */
-/* ------------------------------------------------------------------------- */
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification,
                           uint64_t extranonce_2, double difficulty)
 {
@@ -287,7 +267,7 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
         ESP_LOGE(TAG, "Failed to allocate memory for new job");
         return;
     }
-    memset(next_job, 0, sizeof(bm_job));   /* pointers NULL → veilig vrijgeven */
+    memset(next_job, 0, sizeof(bm_job));
 
     construct_bm_job(notification, merkle_root, GLOBAL_STATE->version_mask,
                      difficulty, next_job);
@@ -315,9 +295,6 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
     ASIC_send_work(GLOBAL_STATE, next_job);
 }
 
-/* ------------------------------------------------------------------------- */
-/*                              SV2 werk                                     */
-/* ------------------------------------------------------------------------- */
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job,
                               double difficulty)
 {
@@ -400,7 +377,6 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
     sv2_conn_t *conn = GLOBAL_STATE->sv2_conn;
     if (!conn) return;
 
-    /* Zelfde lengte-validatie als in SV1-pad. */
     if (conn->extranonce_size > MAX_EXTRANONCE2_LEN) {
         ESP_LOGE(TAG, "SV2 extranonce_size %u > MAX %d, job overgeslagen",
                  conn->extranonce_size, MAX_EXTRANONCE2_LEN);
