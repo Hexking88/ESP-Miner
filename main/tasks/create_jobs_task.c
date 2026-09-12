@@ -36,9 +36,7 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     uint8_t merkle_root[32];
     char extranonce_2_str[MAX_EXTRANONCE2_STR] = "";
 
-    // BELANGRIJK: altijd current_version gebruiken, ook bij hardware version rolling.
-    // Anders krijgt de ASIC elke cyclus dezelfde startversie en vindt hij
-    // telkens dezelfde nonce -> duplicate shares.
+    // Altijd current_version gebruiken als startpunt voor de ASIC.
     uint32_t effective_version = current_version;
 
     if (job->type == JOB_TYPE_SV2_STANDARD) {
@@ -102,6 +100,7 @@ void create_jobs_task(void *pvParameters)
     bool current_work_sent = false;
     uint64_t extranonce_2 = 0;
     uint32_t current_version = 0;
+    uint32_t version_cycle = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
@@ -121,6 +120,7 @@ void create_jobs_task(void *pvParameters)
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
             current_version = new_work->version;
+            version_cycle = 0;
 
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
                 ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
@@ -150,20 +150,26 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // Extranonce2 blijft altijd 0 (4 of 8 bytes afhankelijk van pool).
+        // Extranonce2 blijft altijd 0.
         if (miner_job_is_rollable(current_work)) {
             // extranonce_2++;   // uitgeschakeld
         }
 
-        // Software version rolling draait altijd, ongeacht hardware rolling.
-        // Dit verandert current_version, dat nu ook echt gebruikt wordt
-        // als effective_version in generate_work_from_miner_job().
+        // Version rolling: forceer een nieuwe startversie elke cyclus.
+        // De ASIC begint dan steeds op een ander punt en vindt nieuwe shares.
+        // We mixen een teller in de rollable bits van de version.
         {
-            uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
-            uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
-            for (int i = 0; i < midstates; i++) {
-                current_version = increment_bitmask(current_version, mask);
-            }
+            version_cycle++;
+            uint32_t roll_bits = (current_work->version_mask != 0)
+                                 ? current_work->version_mask
+                                 : BIP320_VERSION_ROLLING_MASK;
+            uint32_t base = current_work->version & ~roll_bits;
+
+            // Elke stap verschuift de version met 0x2000 (laagste bit van de mask).
+            // Door de teller te vermenigvuldigen met 0x2000 doorlopen we de hele
+            // rollable ruimte, niet slechts twee waarden.
+            uint32_t rolled = (version_cycle * 0x2000u) & roll_bits;
+            current_version = base | rolled;
         }
 
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
