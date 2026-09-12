@@ -125,7 +125,12 @@ void create_jobs_task(void *pvParameters)
                     "Protocol switch detected during dequeue, discarding stale item"
                 );
 
-                free(new_work);
+                // V2 blijft ongewijzigd, V1 gebruikt de juiste free-functie
+                if (current_work_protocol == STRATUM_PROTOCOL_V2) {
+                    free(new_work);
+                } else {
+                    free_work_item(GLOBAL_STATE, new_work, current_work_protocol);
+                }
 
                 current_work_protocol = active_protocol;
 
@@ -143,6 +148,7 @@ void create_jobs_task(void *pvParameters)
             bool is_new_job_id = false;
             bool clean = false;
             bool difficulty_changed = false;
+            bool version_mask_changed = false;   // alleen voor V1
 
             /*
              * İş ID kontrolü.
@@ -194,7 +200,8 @@ void create_jobs_task(void *pvParameters)
                 mining_notify *j =
                     (mining_notify *)current_work;
 
-                ESP_LOGI(
+                // V1-log verlaagd naar debug
+                ESP_LOGD(
                     TAG,
                     "New Work Dequeued %s (clean: %s)",
                     j->job_id,
@@ -250,6 +257,11 @@ void create_jobs_task(void *pvParameters)
                 );
 
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
+
+                // Alleen voor V1 forceren we opnieuw verzenden
+                if (current_work_protocol == STRATUM_PROTOCOL_V1) {
+                    version_mask_changed = true;
+                }
             }
 
             /*
@@ -258,14 +270,15 @@ void create_jobs_task(void *pvParameters)
              * Yeni job       -> gönder
              * clean_jobs     -> gönder
              * difficulty değişti -> gönder
+             * version mask değişti (V1) -> gönder
              *
-             * Aynı job + clean=false + difficulty değişmedi
+             * Aynı job + clean=false + difficulty değişmedi + version mask değişmedi
              * -> tekrar gönderme.
              */
             if (!is_new_job_id &&
                 !clean &&
-                !difficulty_changed) {
-
+                !difficulty_changed &&
+                !version_mask_changed) {   // extra voorwaarde voor V1
                 continue;
             }
 
@@ -461,8 +474,9 @@ static void generate_work(
         merkle_root
     );
 
+    // calloc in plaats van malloc zodat alle velden op nul staan
     bm_job *next_job =
-        malloc(sizeof(bm_job));
+        calloc(1, sizeof(bm_job));
 
     if (next_job == NULL) {
 
@@ -520,10 +534,14 @@ static void generate_work(
         return;
     }
 
-    ASIC_send_work(
+    esp_err_t ret = ASIC_send_work(
         GLOBAL_STATE,
         next_job
     );
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ASIC_send_work failed: %d", ret);
+        // Afhankelijk van eigenaarschap: hier eventueel opruimen
+    }
 }
 
 static void generate_work_sv2(
