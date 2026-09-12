@@ -36,10 +36,10 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     uint8_t merkle_root[32];
     char extranonce_2_str[MAX_EXTRANONCE2_STR] = "";
 
-    uint32_t effective_version = job->version;
-    if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(job)) {
-        effective_version = current_version;
-    }
+    // BELANGRIJK: altijd current_version gebruiken, ook bij hardware version rolling.
+    // Anders krijgt de ASIC elke cyclus dezelfde startversie en vindt hij
+    // telkens dezelfde nonce -> duplicate shares.
+    uint32_t effective_version = current_version;
 
     if (job->type == JOB_TYPE_SV2_STANDARD) {
         memcpy(merkle_root, job->merkle_root, 32);
@@ -97,9 +97,6 @@ void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
-    // before any task that touches them can run.
-
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
@@ -134,7 +131,6 @@ void create_jobs_task(void *pvParameters)
             extranonce_2 = 0;
 
             if (!current_work->clean_jobs) {
-                // Staged job for next cycle, let current ASIC cycle finish
                 continue;
             }
         } else {
@@ -154,15 +150,14 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        // Extranonce2 rolling is uitgeschakeld: extranonce2 blijft altijd 0.
-        // De lengte (4 of 8 bytes) wordt door de pool bepaald via job->extranonce2_len.
+        // Extranonce2 blijft altijd 0 (4 of 8 bytes afhankelijk van pool).
         if (miner_job_is_rollable(current_work)) {
             // extranonce_2++;   // uitgeschakeld
         }
 
-        // Software version rolling draait ALTIJD, ongeacht hardware_version_rolling,
-        // zodat we zonder extranonce2-rolling toch nieuwe zoekruimte krijgen
-        // en geen duplicaten meer opleveren.
+        // Software version rolling draait altijd, ongeacht hardware rolling.
+        // Dit verandert current_version, dat nu ook echt gebruikt wordt
+        // als effective_version in generate_work_from_miner_job().
         {
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
