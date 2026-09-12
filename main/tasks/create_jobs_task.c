@@ -4,7 +4,7 @@
 
 #include "global_state.h"
 #include "esp_log.h"
-#include "esp_random.h"
+#include "esp_system.h"
 #include "mining.h"
 #include "miner_job.h"
 #include "string.h"
@@ -20,48 +20,6 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
-// ============================================================
-// Priemgetal helpers
-// ============================================================
-
-// Huidige stap (wordt per job opnieuw gekozen)
-static uint64_t current_prime_step = 3;
-
-static bool is_prime(uint64_t n)
-{
-    if (n < 2) return false;
-    if (n < 4) return true;           // 2 en 3
-    if ((n & 1) == 0) return false;   // even getallen > 2
-    for (uint64_t i = 3; i * i <= n; i += 2) {
-        if (n % i == 0) return false;
-    }
-    return true;
-}
-
-// Kies een random oneven priemgetal in [min, max]
-static uint64_t pick_random_prime(uint64_t min, uint64_t max)
-{
-    if (min < 3) min = 3;
-    if ((min & 1) == 0) min++;
-    if (max < min) return min;
-
-    uint64_t range = max - min + 1;
-    uint64_t r = ((uint64_t)esp_random() << 32) | esp_random();
-    uint64_t candidate = min + (r % range);
-    if ((candidate & 1) == 0) candidate++;
-
-    // Zoek eerstvolgende priemgetal, alleen oneven
-    for (uint64_t tries = 0; tries < 1000; tries++) {
-        if (candidate > max) candidate = min;
-        if (is_prime(candidate)) return candidate;
-        candidate += 2;
-    }
-    return 3; // fallback
-}
-
-// ============================================================
-// Werk genereren uit een miner_job
-// ============================================================
 static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_job_t *job, uint64_t extranonce_2, uint32_t current_version)
 {
     if (!job) return;
@@ -135,15 +93,12 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
     ASIC_send_work(GLOBAL_STATE, next_job);
 }
 
-// ============================================================
-// Hoofdtaak
-// ============================================================
 void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // active_jobs / valid_jobs worden gealloceerd en op nul gezet door
-    // SYSTEM_init_system(), voordat taken die ze gebruiken starten.
+    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
+    // before any task that touches them can run.
 
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
@@ -164,9 +119,7 @@ void create_jobs_task(void *pvParameters)
 
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
-            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)",
-                     (unsigned long)slot_notify, new_work->job_id, new_work->type);
-
+            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
             current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
@@ -180,28 +133,8 @@ void create_jobs_task(void *pvParameters)
 
             extranonce_2 = 0;
 
-            // === Kies een nieuw random oneven priemgetal voor deze job ===
-            uint8_t e2_len = current_work->extranonce2_len;
-            if (e2_len == 0) {
-                current_prime_step = 3;
-                ESP_LOGW(TAG, "extranonce2_len = 0, prime step = 3");
-            } else {
-                uint64_t max_val = (e2_len >= 8)
-                    ? UINT64_MAX
-                    : ((1ULL << (8 * e2_len)) - 1);
-
-                uint64_t prime_max = (max_val > 251) ? 251 : max_val;
-                if (prime_max < 3) prime_max = 3;
-
-                current_prime_step = pick_random_prime(3, prime_max);
-                ESP_LOGI(TAG, "Random oneven prime step gekozen: %" PRIu64
-                              " (e2_len=%u, max=%" PRIu64 ")",
-                         current_prime_step, e2_len, max_val);
-            }
-            // ================================================================
-
             if (!current_work->clean_jobs) {
-                // Staged job voor volgende cyclus, laat huidige ASIC-cyclus aflopen
+                // Staged job for next cycle, let current ASIC cycle finish
                 continue;
             }
         } else {
@@ -209,8 +142,7 @@ void create_jobs_task(void *pvParameters)
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
-            if (!miner_job_is_rollable(current_work) && current_work_sent &&
-                GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+            if (!miner_job_is_rollable(current_work) && current_work_sent && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
                 continue;
             }
@@ -222,22 +154,13 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
-        if (miner_job_is_rollable(current_work)) {
-            // === Tel het gekozen priemgetal op, met modulo-beveiliging ===
-            uint8_t e2_len = current_work->extranonce2_len;
-            if (e2_len > 0 && e2_len < 8) {
-                uint64_t mask = (1ULL << (8 * e2_len)) - 1;
-                extranonce_2 = (extranonce_2 + current_prime_step) & mask;
-            } else {
-                // 8 bytes of meer: gewoon optellen (uint64_t rolt vanzelf rond)
-                extranonce_2 += current_prime_step;
-            }
-            // ================================================================
-        } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-            // Software version rolling voor ASICs zonder hardware version rolling (bv. BM1397) op SV2 Standard Channel
-            uint32_t mask = (current_work->version_mask != 0)
-                ? current_work->version_mask
-                : BIP320_VERSION_ROLLING_MASK;
+        // extranonce2 blijft vast op 0 (met de lengte die de pool voorschrijft).
+        // We verhogen extranonce_2 niet meer.
+
+        // Software version-rolling: altijd toepassen als de hardware het niet zelf doet.
+        // Dit gebeurt binnen de version_mask die de pool heeft toegestaan.
+        if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+            uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
             for (int i = 0; i < midstates; i++) {
                 current_version = increment_bitmask(current_version, mask);
