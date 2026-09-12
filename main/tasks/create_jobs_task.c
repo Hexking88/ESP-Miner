@@ -1,16 +1,12 @@
 #include <sys/time.h>
 #include <limits.h>
-#include <inttypes.h>
-#include <stdbool.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
 
 #include "work_queue.h"
 #include "global_state.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "mining.h"
+#include "string.h"
 #include "esp_timer.h"
 
 #include "asic.h"
@@ -26,109 +22,55 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
-static bool generate_work(GlobalState *GLOBAL_STATE,
-                          mining_notify *notification,
-                          double difficulty);
+static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, double difficulty);
+static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
+static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty);
 
-static bool generate_work_sv2(GlobalState *GLOBAL_STATE,
-                              sv2_job_t *job,
-                              double difficulty);
-
-static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
-                                  sv2_ext_job_t *job,
-                                  double difficulty);
-
-
-/*
- * Free a work item using the correct free function for the
- * protocol it was created under.
- */
-static void free_work_item(GlobalState *GLOBAL_STATE,
-                           void *work,
-                           stratum_protocol_t protocol)
+// Free a work item using the correct free function for the protocol it was created under
+static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protocol_t protocol)
 {
-    if (!work) {
-        return;
-    }
+    if (!work) return;
 
     if (protocol == STRATUM_PROTOCOL_V2) {
-
         if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
             sv2_ext_job_free((sv2_ext_job_t *)work);
         } else {
-            /*
-             * sv2_job_t is a flat allocation.
-             */
             free(work);
         }
-
     } else {
         STRATUM_V1_free_mining_notify(work);
     }
 }
-
 
 void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
     double difficulty = GLOBAL_STATE->pool_difficulty;
-
     void *current_work = NULL;
+    stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
+    int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
-    stratum_protocol_t current_work_protocol =
-        GLOBAL_STATE->stratum_protocol;
-
-    int timeout_ms =
-        ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
-
-    /*
-     * Last job actually dispatched to the ASIC.
-     *
-     * IMPORTANT:
-     * These are updated only after generate_work*() successfully
-     * created and sent the job to the ASIC.
-     */
     static char last_dispatched_job_v1[64] = {0};
     static uint32_t last_dispatched_job_sv2 = UINT32_MAX;
 
-    ESP_LOGI(TAG,
-             "ASIC Job Interval: %d ms",
-             timeout_ms);
-
-    ESP_LOGI(TAG,
-             "ASIC Ready! (Zero-Extranonce2 + BIP320 + Auto-Job-Update)");
+    ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
+    ESP_LOGI(TAG, "ASIC Ready! (Zero-Extranonce2 + BIP320 + Auto-Job-Update)");
 
     while (1) {
-
-        /*
-         * Clear extranonce2 reset request.
-         */
         if (GLOBAL_STATE->reset_extranonce2) {
             GLOBAL_STATE->reset_extranonce2 = false;
         }
 
-
-        /*
-         * Detect protocol changes before dequeuing work.
-         */
-        stratum_protocol_t active_protocol =
-            GLOBAL_STATE->stratum_protocol;
+        // Protokol değişim kontrolü
+        stratum_protocol_t active_protocol = GLOBAL_STATE->stratum_protocol;
 
         if (active_protocol != current_work_protocol) {
-
             if (current_work != NULL) {
-
-                ESP_LOGI(
-                    TAG,
-                    "Protocol switched from %s to %s, discarding current work",
-                    current_work_protocol == STRATUM_PROTOCOL_V2
-                        ? STRATUM_V2
-                        : STRATUM_V1,
-                    active_protocol == STRATUM_PROTOCOL_V2
-                        ? STRATUM_V2
-                        : STRATUM_V1
-                );
+                ESP_LOGI(TAG,
+                         "Protocol switched from %s to %s, discarding current work",
+                         current_work_protocol == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1,
+                         active_protocol == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1);
 
                 free_work_item(
                     GLOBAL_STATE,
@@ -141,94 +83,48 @@ void create_jobs_task(void *pvParameters)
 
             current_work_protocol = active_protocol;
 
-            /*
-             * A protocol change invalidates the previous dispatch state.
-             */
             last_dispatched_job_v1[0] = '\0';
             last_dispatched_job_sv2 = UINT32_MAX;
 
-            /*
-             * Re-read the ASIC interval after protocol changes.
-             */
-            timeout_ms =
-                ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+            timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
         }
 
-
-        /*
-         * Wait for new stratum work.
-         */
         uint64_t start_time = esp_timer_get_time();
 
-        void *new_work =
-            queue_dequeue_timeout(
-                &GLOBAL_STATE->stratum_queue,
-                timeout_ms
-            );
+        void *new_work = queue_dequeue_timeout(
+            &GLOBAL_STATE->stratum_queue,
+            timeout_ms
+        );
 
-        int elapsed_ms =
-            (int)((esp_timer_get_time() - start_time) / 1000);
-
-        timeout_ms -= elapsed_ms;
+        timeout_ms -= (esp_timer_get_time() - start_time) / 1000;
 
         if (timeout_ms < 0) {
             timeout_ms = 0;
         }
 
-
-        /*
-         * A new work item arrived.
-         */
         if (new_work != NULL) {
-
-            active_protocol =
-                GLOBAL_STATE->stratum_protocol;
-
+            active_protocol = GLOBAL_STATE->stratum_protocol;
 
             /*
-             * The currently held work is no longer needed.
+             * Önceki işi bellekten temizle.
              */
-            if (current_work != NULL) {
+            free_work_item(
+                GLOBAL_STATE,
+                current_work,
+                current_work_protocol
+            );
 
-                free_work_item(
-                    GLOBAL_STATE,
-                    current_work,
-                    current_work_protocol
-                );
-
-                current_work = NULL;
-            }
-
+            current_work = NULL;
 
             /*
-             * Protocol may have changed while queue_dequeue_timeout()
-             * was waiting.
-             *
-             * Unfortunately the queue item itself does not carry protocol
-             * metadata, so only discard it here if the protocol changed.
-             *
-             * For normal operation this is safe because the item was
-             * allocated by the producer and a raw free is appropriate for
-             * the stale dequeue path only when protocol ownership cannot
-             * be resolved.
-             *
-             * Prefer preventing this race at the producer/queue layer.
+             * Queue beklerken protokol değişmiş olabilir.
              */
             if (active_protocol != current_work_protocol) {
-
                 ESP_LOGW(
                     TAG,
                     "Protocol switch detected during dequeue, discarding stale item"
                 );
 
-                /*
-                 * Do not attempt protocol-specific cleanup here because
-                 * the queue item does not expose its originating protocol.
-                 *
-                 * Both V1 mining_notify and SV2 flat jobs use heap ownership
-                 * for the top-level allocation. Extended SV2 should normally
-                 * not be left in the queue during a protocol switch.
-                 */
                 free(new_work);
 
                 current_work_protocol = active_protocol;
@@ -242,20 +138,17 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
 
-
             current_work = new_work;
 
-
-            /*
-             * Job state.
-             */
             bool is_new_job_id = false;
             bool clean = false;
             bool difficulty_changed = false;
 
-
             /*
-             * Determine job ID and clean_jobs state.
+             * İş ID kontrolü.
+             *
+             * Burada last_dispatched_job_* henüz değiştirilmez.
+             * Çünkü iş daha ASIC'e gönderilmiş değildir.
              */
             if (current_work_protocol == STRATUM_PROTOCOL_V2) {
 
@@ -266,8 +159,7 @@ void create_jobs_task(void *pvParameters)
 
                     ESP_LOGI(
                         TAG,
-                        "New Work Dequeued SV2 ext job %" PRIu32
-                        " (clean: %s)",
+                        "New Work Dequeued SV2 ext job %lu (clean: %s)",
                         j->job_id,
                         j->clean_jobs ? "true" : "false"
                     );
@@ -285,8 +177,7 @@ void create_jobs_task(void *pvParameters)
 
                     ESP_LOGI(
                         TAG,
-                        "New Work Dequeued SV2 job %" PRIu32
-                        " (clean: %s)",
+                        "New Work Dequeued SV2 job %lu (clean: %s)",
                         j->job_id,
                         j->clean_jobs ? "true" : "false"
                     );
@@ -321,15 +212,9 @@ void create_jobs_task(void *pvParameters)
                 }
             }
 
-
             /*
-             * Difficulty update.
-             *
-             * IMPORTANT:
-             *
-             * Even if the job ID has not changed, a new difficulty means
-             * the ASIC must receive a freshly constructed job so that the
-             * new target/pool difficulty is applied.
+             * Difficulty değiştiyse aynı job ID olsa bile yeni target
+             * ile ASIC'e tekrar iş gönderilmelidir.
              */
             if (GLOBAL_STATE->new_set_mining_difficulty_msg) {
 
@@ -342,15 +227,13 @@ void create_jobs_task(void *pvParameters)
                 difficulty =
                     GLOBAL_STATE->pool_difficulty;
 
-                GLOBAL_STATE->new_set_mining_difficulty_msg =
-                    false;
+                GLOBAL_STATE->new_set_mining_difficulty_msg = false;
 
                 difficulty_changed = true;
             }
 
-
             /*
-             * Version rolling mask update.
+             * Version rolling güncellemesi.
              */
             if (GLOBAL_STATE->new_stratum_version_rolling_msg &&
                 GLOBAL_STATE->ASIC_initalized) {
@@ -366,20 +249,18 @@ void create_jobs_task(void *pvParameters)
                     GLOBAL_STATE->version_mask
                 );
 
-                GLOBAL_STATE->new_stratum_version_rolling_msg =
-                    false;
+                GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
 
-
             /*
-             * Send the work when:
+             * Gönderme şartları:
              *
-             * 1. It is a new job ID
-             * 2. clean_jobs is true
-             * 3. Difficulty changed
+             * Yeni job       -> gönder
+             * clean_jobs     -> gönder
+             * difficulty değişti -> gönder
              *
-             * Same job + clean=false + no difficulty change:
-             * do not resend.
+             * Aynı job + clean=false + difficulty değişmedi
+             * -> tekrar gönderme.
              */
             if (!is_new_job_id &&
                 !clean &&
@@ -388,51 +269,35 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
 
-
         } else {
 
             /*
              * Queue timeout.
              *
-             * Do not repeatedly resend the same job.
-             * ASIC continues its own nonce/version rolling search.
+             * Aynı işi sürekli ASIC'e göndermiyoruz.
              */
             if (current_work == NULL) {
-
-                vTaskDelay(
-                    100 / portTICK_PERIOD_MS
-                );
+                vTaskDelay(100 / portTICK_PERIOD_MS);
 
                 timeout_ms =
-                    ASIC_get_asic_job_frequency_ms(
-                        GLOBAL_STATE
-                    );
+                    ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
                 continue;
             }
 
-
             timeout_ms =
-                ASIC_get_asic_job_frequency_ms(
-                    GLOBAL_STATE
-                );
+                ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
             continue;
         }
 
-
         /*
-         * Final protocol check immediately before job generation.
+         * Son protokol kontrolü.
          */
         active_protocol =
             GLOBAL_STATE->stratum_protocol;
 
         if (active_protocol != current_work_protocol) {
-
-            ESP_LOGW(
-                TAG,
-                "Protocol changed before ASIC dispatch, discarding work"
-            );
 
             free_work_item(
                 GLOBAL_STATE,
@@ -449,147 +314,106 @@ void create_jobs_task(void *pvParameters)
             last_dispatched_job_sv2 = UINT32_MAX;
 
             timeout_ms =
-                ASIC_get_asic_job_frequency_ms(
-                    GLOBAL_STATE
-                );
+                ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
             continue;
         }
 
-
         /*
-         * ASIC must be initialized before generating/sending work.
+         * ASIC henüz hazır değilse işi kaybetme.
          *
-         * Do NOT update last_dispatched_job_* here.
-         * Otherwise the job could be considered dispatched even though
-         * the ASIC never received it.
+         * Eski kod burada generate_work() içine giriyordu ve
+         * last job mantığı nedeniyle aynı job daha sonra skip
+         * edilebiliyordu.
          */
         if (!GLOBAL_STATE->ASIC_initalized) {
 
             ESP_LOGW(
                 TAG,
-                "ASIC not initialized, keeping work pending"
+                "ASIC not initialized, keeping current work pending"
             );
 
             timeout_ms =
-                ASIC_get_asic_job_frequency_ms(
-                    GLOBAL_STATE
-                );
+                ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
-            vTaskDelay(
-                100 / portTICK_PERIOD_MS
-            );
+            vTaskDelay(100 / portTICK_PERIOD_MS);
 
             continue;
         }
 
-
         /*
-         * Generate and dispatch the fresh ASIC job.
+         * ASIC'e taze işi gönder.
+         *
+         * Extranonce2 V1 için sıfır.
+         * SV2 standard/extended için mevcut protokol mantığı korunuyor.
          */
-        bool dispatched = false;
-
-
         if (active_protocol == STRATUM_PROTOCOL_V2) {
 
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
 
-                dispatched =
-                    generate_work_sv2_ext(
-                        GLOBAL_STATE,
-                        (sv2_ext_job_t *)current_work,
-                        difficulty
-                    );
+                generate_work_sv2_ext(
+                    GLOBAL_STATE,
+                    (sv2_ext_job_t *)current_work,
+                    difficulty
+                );
+
+                /*
+                 * İş generate_work_sv2_ext() içine girmiş ve ASIC
+                 * initialized olduğu için dispatch edilmiş kabul edilir.
+                 */
+                sv2_ext_job_t *j =
+                    (sv2_ext_job_t *)current_work;
+
+                last_dispatched_job_sv2 =
+                    j->job_id;
 
             } else {
 
-                dispatched =
-                    generate_work_sv2(
-                        GLOBAL_STATE,
-                        (sv2_job_t *)current_work,
-                        difficulty
-                    );
+                generate_work_sv2(
+                    GLOBAL_STATE,
+                    (sv2_job_t *)current_work,
+                    difficulty
+                );
+
+                sv2_job_t *j =
+                    (sv2_job_t *)current_work;
+
+                last_dispatched_job_sv2 =
+                    j->job_id;
             }
 
         } else {
 
-            dispatched =
-                generate_work(
-                    GLOBAL_STATE,
-                    (mining_notify *)current_work,
-                    difficulty
-                );
-        }
-
-
-        /*
-         * IMPORTANT:
-         *
-         * Only mark the job as dispatched after the ASIC job object was
-         * successfully created and ASIC_send_work() was called.
-         */
-        if (dispatched) {
-
-            if (active_protocol == STRATUM_PROTOCOL_V2) {
-
-                if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
-
-                    sv2_ext_job_t *j =
-                        (sv2_ext_job_t *)current_work;
-
-                    last_dispatched_job_sv2 =
-                        j->job_id;
-
-                } else {
-
-                    sv2_job_t *j =
-                        (sv2_job_t *)current_work;
-
-                    last_dispatched_job_sv2 =
-                        j->job_id;
-                }
-
-            } else {
-
-                mining_notify *j =
-                    (mining_notify *)current_work;
-
-                strncpy(
-                    last_dispatched_job_v1,
-                    j->job_id,
-                    sizeof(last_dispatched_job_v1) - 1
-                );
-
-                last_dispatched_job_v1[
-                    sizeof(last_dispatched_job_v1) - 1
-                ] = '\0';
-            }
-        }
-
-
-        /*
-         * Restore normal ASIC polling interval.
-         */
-        timeout_ms =
-            ASIC_get_asic_job_frequency_ms(
-                GLOBAL_STATE
+            generate_work(
+                GLOBAL_STATE,
+                (mining_notify *)current_work,
+                difficulty
             );
+
+            mining_notify *j =
+                (mining_notify *)current_work;
+
+            strncpy(
+                last_dispatched_job_v1,
+                j->job_id,
+                sizeof(last_dispatched_job_v1) - 1
+            );
+
+            last_dispatched_job_v1[
+                sizeof(last_dispatched_job_v1) - 1
+            ] = '\0';
+        }
+
+        timeout_ms =
+            ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
 
-
-/*
- * STRATUM V1
- */
-static bool generate_work(GlobalState *GLOBAL_STATE,
-                          mining_notify *notification,
-                          double difficulty)
+static void generate_work(
+    GlobalState *GLOBAL_STATE,
+    mining_notify *notification,
+    double difficulty)
 {
-    if (!notification) {
-        return false;
-    }
-
-
     if (GLOBAL_STATE->extranonce_2_len >
         MAX_EXTRANONCE2_LEN) {
 
@@ -600,18 +424,11 @@ static bool generate_work(GlobalState *GLOBAL_STATE,
             MAX_EXTRANONCE2_LEN
         );
 
-        return false;
+        return;
     }
 
-
     /*
-     * Industry-standard zero extranonce2.
-     *
-     * Example:
-     *
-     * extranonce_2_len = 4
-     *
-     * => "00000000"
+     * Sabit 0 (Foundry/Antpool standardı)
      */
     char extranonce_2_str[MAX_EXTRANONCE2_STR];
 
@@ -625,10 +442,6 @@ static bool generate_work(GlobalState *GLOBAL_STATE,
         GLOBAL_STATE->extranonce_2_len * 2
     ] = '\0';
 
-
-    /*
-     * Coinbase hash.
-     */
     uint8_t coinbase_tx_hash[32];
 
     calculate_coinbase_tx_hash(
@@ -639,23 +452,15 @@ static bool generate_work(GlobalState *GLOBAL_STATE,
         coinbase_tx_hash
     );
 
-
-    /*
-     * Merkle root.
-     */
     uint8_t merkle_root[32];
 
     calculate_merkle_root_hash(
         coinbase_tx_hash,
-        (uint8_t (*)[32])notification->merkle_branches,
+        (uint8_t(*)[32])notification->merkle_branches,
         notification->n_merkle_branches,
         merkle_root
     );
 
-
-    /*
-     * Allocate ASIC job.
-     */
     bm_job *next_job =
         malloc(sizeof(bm_job));
 
@@ -666,13 +471,9 @@ static bool generate_work(GlobalState *GLOBAL_STATE,
             "Failed to allocate memory for new job"
         );
 
-        return false;
+        return;
     }
 
-
-    /*
-     * Construct job.
-     */
     construct_bm_job(
         notification,
         merkle_root,
@@ -681,10 +482,6 @@ static bool generate_work(GlobalState *GLOBAL_STATE,
         next_job
     );
 
-
-    /*
-     * Job metadata.
-     */
     next_job->extranonce2 =
         strdup(extranonce_2_str);
 
@@ -694,9 +491,8 @@ static bool generate_work(GlobalState *GLOBAL_STATE,
     next_job->version_mask =
         GLOBAL_STATE->version_mask;
 
-
-    if (next_job->extranonce2 == NULL ||
-        next_job->jobid == NULL) {
+    if (next_job->jobid == NULL ||
+        next_job->extranonce2 == NULL) {
 
         ESP_LOGE(
             TAG,
@@ -707,34 +503,34 @@ static bool generate_work(GlobalState *GLOBAL_STATE,
         free(next_job->extranonce2);
         free(next_job);
 
-        return false;
+        return;
     }
 
+    if (!GLOBAL_STATE->ASIC_initalized) {
 
-    /*
-     * Send to ASIC.
-     */
+        ESP_LOGW(
+            TAG,
+            "ASIC not initialized, skipping job send"
+        );
+
+        free(next_job->jobid);
+        free(next_job->extranonce2);
+        free(next_job);
+
+        return;
+    }
+
     ASIC_send_work(
         GLOBAL_STATE,
         next_job
     );
-
-    return true;
 }
 
-
-/*
- * STRATUM V2 STANDARD CHANNEL
- */
-static bool generate_work_sv2(GlobalState *GLOBAL_STATE,
-                              sv2_job_t *sv2_job,
-                              double difficulty)
+static void generate_work_sv2(
+    GlobalState *GLOBAL_STATE,
+    sv2_job_t *sv2_job,
+    double difficulty)
 {
-    if (!sv2_job) {
-        return false;
-    }
-
-
     bm_job *next_job =
         malloc(sizeof(bm_job));
 
@@ -745,17 +541,12 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE,
             "Failed to allocate memory for new SV2 job"
         );
 
-        return false;
+        return;
     }
-
 
     uint32_t version_mask =
         GLOBAL_STATE->version_mask;
 
-
-    /*
-     * Basic job parameters.
-     */
     next_job->version =
         sv2_job->version;
 
@@ -771,10 +562,6 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE,
     next_job->pool_diff =
         difficulty;
 
-
-    /*
-     * Byte order conversion.
-     */
     reverse_32bit_words(
         sv2_job->merkle_root,
         next_job->merkle_root
@@ -785,16 +572,6 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE,
         next_job->prev_block_hash
     );
 
-
-    /*
-     * Midstate base data.
-     *
-     * First 64 bytes of the block header:
-     *
-     * version      4
-     * prevhash    32
-     * merkle[0:28] 28
-     */
     uint8_t midstate_data[64];
 
     uint32_t base_version =
@@ -818,10 +595,6 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE,
         28
     );
 
-
-    /*
-     * Base midstate.
-     */
     uint8_t midstate[32];
 
     midstate_sha256_bin(
@@ -835,19 +608,9 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE,
         next_job->midstate
     );
 
-
-    /*
-     * Version rolling.
-     */
     if (version_mask != 0) {
 
-        uint32_t rolled_version;
-
-
-        /*
-         * Version #1
-         */
-        rolled_version =
+        uint32_t rolled_version =
             increment_bitmask(
                 base_version,
                 version_mask
@@ -870,10 +633,6 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE,
             next_job->midstate1
         );
 
-
-        /*
-         * Version #2
-         */
         rolled_version =
             increment_bitmask(
                 rolled_version,
@@ -897,10 +656,6 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE,
             next_job->midstate2
         );
 
-
-        /*
-         * Version #3
-         */
         rolled_version =
             increment_bitmask(
                 rolled_version,
@@ -931,10 +686,6 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE,
         next_job->num_midstates = 1;
     }
 
-
-    /*
-     * Job ID.
-     */
     char jobid_str[16];
 
     snprintf(
@@ -944,19 +695,14 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE,
         sv2_job->job_id
     );
 
-
     next_job->jobid =
         strdup(jobid_str);
 
-    /*
-     * Standard SV2 channel does not use V1-style extranonce2.
-     */
     next_job->extranonce2 =
         strdup("");
 
     next_job->version_mask =
         version_mask;
-
 
     if (next_job->jobid == NULL ||
         next_job->extranonce2 == NULL) {
@@ -970,47 +716,40 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE,
         free(next_job->extranonce2);
         free(next_job);
 
-        return false;
+        return;
     }
 
+    if (!GLOBAL_STATE->ASIC_initalized) {
 
-    /*
-     * Send to ASIC.
-     */
+        ESP_LOGW(
+            TAG,
+            "ASIC not initialized, skipping SV2 job send"
+        );
+
+        free(next_job->jobid);
+        free(next_job->extranonce2);
+        free(next_job);
+
+        return;
+    }
+
     ASIC_send_work(
         GLOBAL_STATE,
         next_job
     );
-
-    return true;
 }
 
-
-/*
- * STRATUM V2 EXTENDED CHANNEL
- */
-static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
-                                  sv2_ext_job_t *ext_job,
-                                  double difficulty)
+static void generate_work_sv2_ext(
+    GlobalState *GLOBAL_STATE,
+    sv2_ext_job_t *ext_job,
+    double difficulty)
 {
-    if (!ext_job) {
-        return false;
-    }
-
-
     sv2_conn_t *conn =
         GLOBAL_STATE->sv2_conn;
 
     if (!conn) {
-
-        ESP_LOGE(
-            TAG,
-            "SV2 connection is NULL"
-        );
-
-        return false;
+        return;
     }
-
 
     bm_job *next_job =
         malloc(sizeof(bm_job));
@@ -1022,34 +761,14 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
             "Failed to allocate memory for SV2 ext job"
         );
 
-        return false;
+        return;
     }
-
 
     uint32_t version_mask =
         GLOBAL_STATE->version_mask;
 
-
-    /*
-     * Extended channel extranonce.
-     */
     uint8_t extranonce_2_len =
         conn->extranonce_size;
-
-    if (extranonce_2_len >
-        sizeof(((uint8_t[32]){0}))) {
-
-        ESP_LOGE(
-            TAG,
-            "SV2 extranonce size %u exceeds 32 bytes",
-            extranonce_2_len
-        );
-
-        free(next_job);
-
-        return false;
-    }
-
 
     uint8_t extranonce_2[32];
 
@@ -1059,32 +778,20 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
         sizeof(extranonce_2)
     );
 
-
-    /*
-     * Coinbase transaction hash.
-     */
     uint8_t coinbase_tx_hash[32];
 
     calculate_coinbase_tx_hash_bin(
         ext_job->coinbase_prefix,
         ext_job->coinbase_prefix_len,
-
         conn->extranonce_prefix,
         conn->extranonce_prefix_len,
-
         extranonce_2,
         extranonce_2_len,
-
         ext_job->coinbase_suffix,
         ext_job->coinbase_suffix_len,
-
         coinbase_tx_hash
     );
 
-
-    /*
-     * Merkle root.
-     */
     uint8_t merkle_root[32];
 
     calculate_merkle_root_hash(
@@ -1094,10 +801,6 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
         merkle_root
     );
 
-
-    /*
-     * Basic job fields.
-     */
     next_job->version =
         ext_job->version;
 
@@ -1113,10 +816,6 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
     next_job->pool_diff =
         difficulty;
 
-
-    /*
-     * Byte order conversion.
-     */
     reverse_32bit_words(
         merkle_root,
         next_job->merkle_root
@@ -1127,10 +826,6 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
         next_job->prev_block_hash
     );
 
-
-    /*
-     * Build midstate data.
-     */
     uint8_t midstate_data[64];
 
     uint32_t base_version =
@@ -1154,10 +849,6 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
         28
     );
 
-
-    /*
-     * Base midstate.
-     */
     uint8_t midstate[32];
 
     midstate_sha256_bin(
@@ -1171,19 +862,9 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
         next_job->midstate
     );
 
-
-    /*
-     * Version rolling.
-     */
     if (version_mask != 0) {
 
-        uint32_t rolled_version;
-
-
-        /*
-         * Version #1
-         */
-        rolled_version =
+        uint32_t rolled_version =
             increment_bitmask(
                 base_version,
                 version_mask
@@ -1206,10 +887,6 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
             next_job->midstate1
         );
 
-
-        /*
-         * Version #2
-         */
         rolled_version =
             increment_bitmask(
                 rolled_version,
@@ -1233,10 +910,6 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
             next_job->midstate2
         );
 
-
-        /*
-         * Version #3
-         */
         rolled_version =
             increment_bitmask(
                 rolled_version,
@@ -1267,10 +940,6 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
         next_job->num_midstates = 1;
     }
 
-
-    /*
-     * Job ID.
-     */
     char jobid_str[16];
 
     snprintf(
@@ -1283,10 +952,6 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
     next_job->jobid =
         strdup(jobid_str);
 
-
-    /*
-     * Extended-channel extranonce2.
-     */
     char en2_hex[65];
 
     bin2hex(
@@ -1302,7 +967,6 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
     next_job->version_mask =
         version_mask;
 
-
     if (next_job->jobid == NULL ||
         next_job->extranonce2 == NULL) {
 
@@ -1315,17 +979,25 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE,
         free(next_job->extranonce2);
         free(next_job);
 
-        return false;
+        return;
     }
 
+    if (!GLOBAL_STATE->ASIC_initalized) {
 
-    /*
-     * Send to ASIC.
-     */
+        ESP_LOGW(
+            TAG,
+            "ASIC not initialized, skipping SV2 ext job send"
+        );
+
+        free(next_job->jobid);
+        free(next_job->extranonce2);
+        free(next_job);
+
+        return;
+    }
+
     ASIC_send_work(
         GLOBAL_STATE,
         next_job
     );
-
-    return true;
 }
