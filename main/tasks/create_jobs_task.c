@@ -154,9 +154,16 @@ void create_jobs_task(void *pvParameters)
         }
         current_work_sent = true;
 
+        // extranonce2 blijft altijd 0 (4 of 8 bytes, afhankelijk van pool).
+        // We rollen alleen nog op version, zodat we zonder extranonce2-rolling
+        // toch nieuwe zoekruimte krijgen en shares blijven vinden.
         if (miner_job_is_rollable(current_work)) {
-            // extranonce_2++;   // niet rollen, blijft standaard 0 (4/8 bytes afhankelijk van pool)
-        } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
+            // extranonce_2++;   // uitgeschakeld: extranonce2 blijft 0
+        }
+
+        // Software version rolling: altijd uitvoeren als de ASIC het niet
+        // hardwarematig doet. Onafhankelijk van of de job rollable is.
+        if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
             // Software version rolling for ASICs without hardware version rolling (e.g. BM1397) on SV2 Standard Channel
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
@@ -164,6 +171,7 @@ void create_jobs_task(void *pvParameters)
                 current_version = increment_bitmask(current_version, mask);
             }
         }
+
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
